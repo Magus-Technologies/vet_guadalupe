@@ -428,13 +428,9 @@ if ($search) {
 // Filtro por sede (sin afectar lógica SUNAT)
 if (!verTodasSedes()) { $where .= " AND v.sede_id=" . getSede(); }
 
-$LIMITE = 100;
-$ventas = $db->prepare("SELECT v.*,c.nombre as cliente,m.nombre as mascota FROM ventas v JOIN clientes c ON c.id=v.cliente_id LEFT JOIN mascotas m ON m.id=v.mascota_id WHERE $where ORDER BY v.fecha DESC LIMIT $LIMITE");
-$ventas->execute($params); $ventas = $ventas->fetchAll();
-
-/* Los totales se calculan sobre TODO el filtro, no sobre las 100 filas que se
-   muestran: sumarlos desde $ventas daba cifras cortadas cuando el período
-   tenía más comprobantes que el límite. */
+/* Los totales se calculan sobre TODO el filtro, no sobre la página visible:
+   sumarlos desde $ventas daba cifras cortadas cuando el período tenía más
+   comprobantes que el límite. También da el total para paginar. */
 $resumen = $db->prepare("
     SELECT COUNT(*) AS n,
            COALESCE(SUM(CASE WHEN v.estado='pagado'    THEN v.total ELSE 0 END),0) AS total_pagado,
@@ -450,6 +446,32 @@ $res = $resumen->fetch() ?: ['n'=>0,'total_pagado'=>0,'n_pagados'=>0,'n_pendient
 $total_periodo  = (float)$res['total_pagado'];
 $total_filtrado = (int)$res['n'];
 $hay_filtros    = ($search !== '' || $estado_f !== '' || $tipo_f !== '' || $sunat_f !== '' || $metodo_f !== '');
+
+// ─── Paginación ─────────────────────────────────────────────────
+// $por_pag y $pagina se validan contra una lista blanca / se castean a int
+// antes de interpolarse en el LIMIT (no son bindeables como parámetros).
+$por_pag = (int)($_GET['pp'] ?? 50);
+if (!in_array($por_pag, [25, 50, 100, 200], true)) $por_pag = 50;
+
+$total_paginas = max(1, (int)ceil($total_filtrado / $por_pag));
+$pagina        = max(1, (int)($_GET['pag'] ?? 1));
+if ($pagina > $total_paginas) $pagina = $total_paginas;
+$offset        = ($pagina - 1) * $por_pag;
+
+$desde_fila = $total_filtrado ? $offset + 1 : 0;
+$hasta_fila = min($offset + $por_pag, $total_filtrado);
+
+$ventas = $db->prepare("SELECT v.*,c.nombre as cliente,m.nombre as mascota FROM ventas v JOIN clientes c ON c.id=v.cliente_id LEFT JOIN mascotas m ON m.id=v.mascota_id WHERE $where ORDER BY v.fecha DESC, v.id DESC LIMIT $por_pag OFFSET $offset");
+$ventas->execute($params); $ventas = $ventas->fetchAll();
+
+/** Arma un link conservando todos los filtros vigentes. */
+$urlCon = function(array $extra) use ($search,$estado_f,$tipo_f,$sunat_f,$metodo_f,$fecha_d,$fecha_h,$por_pag,$pagina) {
+    return '?' . http_build_query(array_merge([
+        'p'=>'facturacion', 'q'=>$search, 'estado'=>$estado_f, 'tipo'=>$tipo_f,
+        'sunat_e'=>$sunat_f, 'metodo'=>$metodo_f, 'fecha_d'=>$fecha_d,
+        'fecha_h'=>$fecha_h, 'pp'=>$por_pag, 'pag'=>$pagina,
+    ], $extra));
+};
 
 /* Opciones del filtro de método tomadas de lo REALMENTE guardado: el catálogo
    `metodos_pago` usa nombres con mayúscula ("Yape") y las ventas guardan otra
@@ -995,6 +1017,9 @@ if (isset($_SESSION['flash_error'])) {
 <div class="card mb-2" style="padding:14px 18px">
   <form method="GET" class="flex items-center gap-2" style="flex-wrap:wrap">
     <input type="hidden" name="p" value="facturacion">
+    <?php /* Conserva el tamaño de página; al filtrar se vuelve a la 1 porque
+             `pag` no se envía y arranca en 1 por defecto. */ ?>
+    <input type="hidden" name="pp" value="<?= (int)$por_pag ?>">
     <input class="form-input" name="q" value="<?= clean($search) ?>" placeholder="Buscar cliente, serie..." style="width:200px">
 
     <input class="form-input" type="date" name="fecha_d" value="<?= clean($fecha_d) ?>" style="width:150px" title="Desde">
@@ -1043,12 +1068,8 @@ if (isset($_SESSION['flash_error'])) {
   <!-- Atajos de rango: lo que más se usa a diario -->
   <div class="flex gap-1 mt-2" style="flex-wrap:wrap">
     <?php
-      $qs = function(array $extra) use ($search,$estado_f,$tipo_f,$sunat_f,$metodo_f) {
-          return '?' . http_build_query(array_merge([
-              'p'=>'facturacion','q'=>$search,'estado'=>$estado_f,
-              'tipo'=>$tipo_f,'sunat_e'=>$sunat_f,'metodo'=>$metodo_f,
-          ], $extra));
-      };
+      // Cambiar de rango vuelve a la página 1: el número de páginas cambia.
+      $qs = fn(array $extra) => $urlCon(array_merge(['pag' => 1], $extra));
       $rangos = [
         'Hoy'          => [date('Y-m-d'), date('Y-m-d')],
         'Ayer'         => [date('Y-m-d', strtotime('-1 day')), date('Y-m-d', strtotime('-1 day'))],
@@ -1063,10 +1084,10 @@ if (isset($_SESSION['flash_error'])) {
     <?php endforeach; ?>
 
     <span class="text-xs text-muted" style="margin-left:auto;align-self:center">
-      <?php if ($total_filtrado > $LIMITE): ?>
-        Mostrando <?= $LIMITE ?> de <strong><?= $total_filtrado ?></strong> — afiná el filtro para ver el resto
+      <?php if ($total_filtrado): ?>
+        Mostrando <strong><?= $desde_fila ?>–<?= $hasta_fila ?></strong> de <strong><?= $total_filtrado ?></strong>
       <?php else: ?>
-        <?= $total_filtrado ?> comprobante<?= $total_filtrado === 1 ? '' : 's' ?>
+        Sin resultados
       <?php endif; ?>
     </span>
   </div>
@@ -1123,6 +1144,54 @@ if (isset($_SESSION['flash_error'])) {
       </tbody>
     </table>
   </div>
+
+  <?php if ($total_filtrado > 0): ?>
+  <div style="padding:12px 18px;border-top:1px solid var(--border)" class="flex items-center gap-2" >
+    <form method="GET" class="flex items-center gap-1" style="margin:0">
+      <?php foreach (['q'=>$search,'estado'=>$estado_f,'tipo'=>$tipo_f,'sunat_e'=>$sunat_f,
+                      'metodo'=>$metodo_f,'fecha_d'=>$fecha_d,'fecha_h'=>$fecha_h] as $k=>$vv): ?>
+        <input type="hidden" name="<?= $k ?>" value="<?= clean($vv) ?>">
+      <?php endforeach; ?>
+      <input type="hidden" name="p" value="facturacion">
+      <span class="text-xs text-muted">Por página</span>
+      <select class="form-input" name="pp" onchange="this.form.submit()" style="width:80px;padding:4px 8px;font-size:12px">
+        <?php foreach ([25,50,100,200] as $n): ?>
+          <option value="<?= $n ?>" <?= $por_pag===$n?'selected':'' ?>><?= $n ?></option>
+        <?php endforeach; ?>
+      </select>
+    </form>
+
+    <?php if ($total_paginas > 1): ?>
+    <div class="flex gap-1 items-center" style="margin-left:auto;flex-wrap:wrap">
+      <a href="<?= $urlCon(['pag'=>1]) ?>" class="btn btn-xs<?= $pagina<=1?' disabled':'' ?>"
+         <?= $pagina<=1?'style="pointer-events:none;opacity:.4"':'' ?> title="Primera">«</a>
+      <a href="<?= $urlCon(['pag'=>$pagina-1]) ?>" class="btn btn-xs"
+         <?= $pagina<=1?'style="pointer-events:none;opacity:.4"':'' ?>>‹ Anterior</a>
+
+      <?php
+        // Ventana de páginas alrededor de la actual, con elipsis en los bordes.
+        $ini = max(1, $pagina - 2);
+        $fin = min($total_paginas, $pagina + 2);
+        if ($ini > 1) echo '<span class="text-xs text-muted">…</span>';
+        for ($i = $ini; $i <= $fin; $i++):
+      ?>
+        <a href="<?= $urlCon(['pag'=>$i]) ?>" class="btn btn-xs<?= $i===$pagina?' btn-primary':'' ?>"><?= $i ?></a>
+      <?php endfor;
+        if ($fin < $total_paginas) echo '<span class="text-xs text-muted">…</span>';
+      ?>
+
+      <a href="<?= $urlCon(['pag'=>$pagina+1]) ?>" class="btn btn-xs"
+         <?= $pagina>=$total_paginas?'style="pointer-events:none;opacity:.4"':'' ?>>Siguiente ›</a>
+      <a href="<?= $urlCon(['pag'=>$total_paginas]) ?>" class="btn btn-xs"
+         <?= $pagina>=$total_paginas?'style="pointer-events:none;opacity:.4"':'' ?> title="Última">»</a>
+
+      <span class="text-xs text-muted" style="margin-left:6px">Pág. <?= $pagina ?> de <?= $total_paginas ?></span>
+    </div>
+    <?php else: ?>
+      <span class="text-xs text-muted" style="margin-left:auto">Página única</span>
+    <?php endif; ?>
+  </div>
+  <?php endif; ?>
 </div>
 
 <!-- Menú flotante de impresión (compartido para todas las filas) -->
