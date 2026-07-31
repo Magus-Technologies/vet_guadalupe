@@ -96,6 +96,41 @@ function limpiarRastroSunat(PDO $db, int $ventaId): void {
 }
 
 /**
+ * Arma un mensaje de error útil a partir de la respuesta de la API.
+ *
+ * SunatService cae en un texto genérico ("Error al generar XML.") cuando la
+ * respuesta no trae la clave `mensaje` — típico de una validación de Laravel,
+ * que responde `message` + `errors` en inglés. El motivo real queda en
+ * `detalle`, así que se rescata de ahí.
+ */
+function explicarError(array $r): string {
+    $base = trim((string)($r['mensaje'] ?? '')) ?: 'Error desconocido.';
+    $d    = $r['detalle'] ?? null;
+    if (!is_array($d)) return $base;
+
+    $partes = [];
+
+    // Validación estilo Laravel: {"message": "...", "errors": {"campo": ["..."]}}
+    if (!empty($d['errors']) && is_array($d['errors'])) {
+        foreach ($d['errors'] as $campo => $msgs) {
+            $partes[] = $campo . ': ' . (is_array($msgs) ? implode(' / ', $msgs) : (string)$msgs);
+        }
+    }
+    foreach (['message', 'error', 'detalle', 'descripcion'] as $k) {
+        if (!empty($d[$k]) && is_scalar($d[$k])) { $partes[] = (string)$d[$k]; break; }
+    }
+
+    // Último recurso: el cuerpo crudo, recortado.
+    if (!$partes) {
+        $crudo = $d['raw'] ?? json_encode($d, JSON_UNESCAPED_UNICODE);
+        $partes[] = mb_substr((string)$crudo, 0, 300);
+    }
+
+    $http = isset($d['http']) ? ' [HTTP ' . $d['http'] . ']' : '';
+    return $base . $http . ' → ' . implode(' | ', $partes);
+}
+
+/**
  * Procesa UN comprobante y devuelve el resultado.
  *
  * Las dos etapas van separadas a propósito: 'regenerar' arma y firma el XML sin
@@ -119,7 +154,7 @@ function procesarUno(PDO $db, SunatService $svc, string $accion, int $ventaId): 
         limpiarRastroSunat($db, $ventaId);
         $r = $svc->generarXml($ventaId);
         return ['ok' => $r['ok'], 'ref' => $ref,
-                'msg' => $r['ok'] ? 'XML regenerado y firmado.' : $r['mensaje']];
+                'msg' => $r['ok'] ? 'XML regenerado y firmado.' : explicarError($r)];
     }
 
     if (empty($v['sunat_xml'])) {
@@ -127,7 +162,7 @@ function procesarUno(PDO $db, SunatService $svc, string $accion, int $ventaId): 
                 'msg' => 'OMITIDO: no tiene XML. Regeneralo primero.'];
     }
     $r = $svc->enviarSunat($ventaId);
-    return ['ok' => $r['ok'], 'ref' => $ref, 'msg' => $r['mensaje']];
+    return ['ok' => $r['ok'], 'ref' => $ref, 'msg' => $r['ok'] ? $r['mensaje'] : explicarError($r)];
 }
 
 /*
@@ -165,7 +200,7 @@ if (($_GET['ajax'] ?? '') === '1') {
 // ─── DATOS ────────────────────────────────────────────────────────
 $comprobantes = $db->query("
     SELECT v.id, v.serie, v.numero, v.tipo_comprobante, v.fecha, v.total,
-           v.estado, v.sunat_estado, v.sunat_cdr, v.sunat_xml,
+           v.estado, v.sunat_estado, v.sunat_cdr, v.sunat_xml, v.sunat_mensaje,
            COALESCE(c.nombre,'—') AS cliente
     FROM ventas v
     LEFT JOIN clientes c ON c.id = v.cliente_id
@@ -267,6 +302,8 @@ if (isset($_SESSION['flash_error'])) {
       <div class="flex gap-1 flex-wrap" id="barraAcciones">
         <button type="button" class="btn btn-sm" onclick="marcarTodos(true)">Todos</button>
         <button type="button" class="btn btn-sm" onclick="marcarTodos(false)">Ninguno</button>
+        <button type="button" class="btn btn-sm" onclick="marcarPor('fallo')" title="Los que quedaron rechazados en el último intento">Solo fallados</button>
+        <button type="button" class="btn btn-sm" onclick="marcarPor('listo')" title="Los que ya tienen XML y solo falta enviar">Solo con XML listo</button>
         <?php $bloqueado = SUNAT_ENDPOINT !== 'produccion' ? 'disabled title="Cambiá la configuración a producción primero"' : ''; ?>
         <button type="button" class="btn btn-sm btnAccion" <?= $bloqueado ?>
           onclick="procesar('regenerar')">⚡ Solo regenerar XML</button>
@@ -311,7 +348,10 @@ if (isset($_SESSION['flash_error'])) {
         <tbody>
           <?php foreach ($reprocesables as $v): ?>
           <tr id="fila-<?= $v['id'] ?>">
-            <td><input type="checkbox" class="chk" value="<?= $v['id'] ?>" data-ref="<?= clean($v['serie']) ?>-<?= str_pad((string)$v['numero'],8,'0',STR_PAD_LEFT) ?>"></td>
+            <td><input type="checkbox" class="chk" value="<?= $v['id'] ?>"
+                       data-ref="<?= clean($v['serie']) ?>-<?= str_pad((string)$v['numero'],8,'0',STR_PAD_LEFT) ?>"
+                       data-fallo="<?= $v['sunat_estado'] === 'rechazado' ? '1' : '0' ?>"
+                       data-listo="<?= !empty($v['sunat_xml']) ? '1' : '0' ?>"></td>
             <td class="td-main">
               <span class="badge b-gray"><?= strtoupper($v['tipo_comprobante']) ?></span>
               <div style="font-size:12px;margin-top:2px;font-family:monospace"><?= clean($v['serie']) ?>-<?= str_pad((string)$v['numero'],8,'0',STR_PAD_LEFT) ?></div>
@@ -336,6 +376,11 @@ if (isset($_SESSION['flash_error'])) {
               <?php else: ?>
                 <span class="badge b-amber"><span class="dot"></span>SIN XML</span>
                 <div class="text-xs text-muted" style="margin-top:2px">Regenerar primero</div>
+              <?php endif; ?>
+              <?php if ($v['sunat_estado'] === 'rechazado' && !empty($v['sunat_mensaje'])): ?>
+                <div class="text-xs" style="margin-top:3px;color:var(--red);max-width:280px">
+                  ⚠ <?= clean(mb_substr($v['sunat_mensaje'], 0, 160)) ?>
+                </div>
               <?php endif; ?>
             </td>
             <td>
@@ -364,6 +409,17 @@ if (isset($_SESSION['flash_error'])) {
   window.marcarTodos = function(v){
     if (corriendo) return;
     document.querySelectorAll('.chk').forEach(function(c){ c.checked = v; });
+  };
+
+  // Selecciona por atributo: 'fallo' (rechazados) o 'listo' (ya tienen XML).
+  window.marcarPor = function(attr){
+    if (corriendo) return;
+    var n = 0;
+    document.querySelectorAll('.chk').forEach(function(c){
+      c.checked = c.dataset[attr] === '1';
+      if (c.checked) n++;
+    });
+    if (!n) alert('No hay comprobantes en ese estado.');
   };
 
   window.detener = function(){
