@@ -1976,7 +1976,12 @@ function eliminarFilaPago(idx) {
 
 function renderPagosUI() {
     var container = document.getElementById('lista-metodos-pago-ui');
-    var _txt = document.getElementById('tot-total').textContent;
+    var totEl     = document.getElementById('tot-total');
+    // Este script se sirve en las dos vistas, pero estos nodos solo existen en
+    // el formulario de venta. En el listado se sale sin hacer nada.
+    if (!container || !totEl) return;
+
+    var _txt = totEl.textContent;
     var totalVenta = parseFloat((_txt.match(/\d[\d.,-]*/) || ['0'])[0].replace(',', '.')) || 0;
     var sumPagos = pagosUI.reduce(function(s, p) { return s + p.monto; }, 0);
     var diff = totalVenta - sumPagos;
