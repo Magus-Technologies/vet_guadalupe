@@ -27,9 +27,8 @@ $sunat_svc = __DIR__ . '/../includes/sunat/SunatService.php';
 $sunat_ok  = file_exists($sunat_cfg) && file_exists($sunat_svc);
 if ($sunat_ok) { require_once $sunat_cfg; require_once $sunat_svc; }
 
-// Tamaño máximo de lote. Cada comprobante son 2 llamadas HTTP a SUNAT: un lote
-// grande agota max_execution_time y corta a mitad de camino.
-define('LOTE_MAX', 15);
+// Pausa entre comprobantes (ms) para no golpear la API de corrido.
+define('PAUSA_MS', 400);
 
 /**
  * Abre el CDR guardado y devuelve cómo lo firmó SUNAT.
@@ -96,64 +95,70 @@ function limpiarRastroSunat(PDO $db, int $ventaId): void {
     ")->execute([$ventaId]);
 }
 
-// ─── POST ─────────────────────────────────────────────────────────
-$reporte = [];
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && $sunat_ok) {
-    $pa  = $_POST['action'] ?? '';
-    $ids = array_map('intval', (array)($_POST['ids'] ?? []));
+/**
+ * Procesa UN comprobante y devuelve el resultado.
+ *
+ * Las dos etapas van separadas a propósito: 'regenerar' arma y firma el XML sin
+ * tocar SUNAT, así se puede revisar antes de emitir; 'enviar' sí emite.
+ */
+function procesarUno(PDO $db, SunatService $svc, string $accion, int $ventaId): array {
+    $st = $db->prepare("SELECT id,serie,numero,tipo_comprobante,sunat_cdr,sunat_xml FROM ventas WHERE id=?");
+    $st->execute([$ventaId]);
+    $v = $st->fetch();
+    if (!$v) return ['ok' => false, 'ref' => "#$ventaId", 'msg' => 'Comprobante inexistente.'];
 
-    // Las dos etapas van por separado a propósito: regenerar no toca SUNAT
-    // producción, así se puede revisar el XML antes de emitirlo de verdad.
-    if (in_array($pa, ['regenerar', 'enviar'], true) && $ids) {
-        if (SUNAT_ENDPOINT !== 'produccion') {
-            $_SESSION['flash_error'] = 'La configuración SUNAT sigue en BETA. Cambiala a producción primero.';
-            header('Location: ' . BASE_URL . '/index.php?p=reenvio_sunat'); exit;
-        }
+    $ref = $v['serie'] . '-' . str_pad((string)$v['numero'], 8, '0', STR_PAD_LEFT);
 
-        if (count($ids) > LOTE_MAX) {
-            $_SESSION['flash_error'] = 'Seleccionaste ' . count($ids) . ' comprobantes. El máximo por lote es ' . LOTE_MAX . ' para no cortar por timeout.';
-            header('Location: ' . BASE_URL . '/index.php?p=reenvio_sunat'); exit;
-        }
+    // Salvaguarda: nunca tocar algo ya aceptado de verdad.
+    if (analizarCdr($v['sunat_cdr'])['ambiente'] === 'produccion') {
+        return ['ok' => false, 'ref' => $ref, 'omitido' => true,
+                'msg' => 'OMITIDO: ya tiene CDR de producción. Solo se anula con nota de crédito.'];
+    }
 
-        // Cada llamada a la API puede tardar varios segundos.
-        @set_time_limit(0);
-        @ignore_user_abort(true);
+    if ($accion === 'regenerar') {
+        limpiarRastroSunat($db, $ventaId);
+        $r = $svc->generarXml($ventaId);
+        return ['ok' => $r['ok'], 'ref' => $ref,
+                'msg' => $r['ok'] ? 'XML regenerado y firmado.' : $r['mensaje']];
+    }
 
-        $accion = $pa === 'regenerar' ? 'Regenerar' : 'Enviar';
-        $svc    = new SunatService($db);
+    if (empty($v['sunat_xml'])) {
+        return ['ok' => false, 'ref' => $ref, 'omitido' => true,
+                'msg' => 'OMITIDO: no tiene XML. Regeneralo primero.'];
+    }
+    $r = $svc->enviarSunat($ventaId);
+    return ['ok' => $r['ok'], 'ref' => $ref, 'msg' => $r['mensaje']];
+}
 
-        foreach ($ids as $vid) {
-            $st = $db->prepare("SELECT id,serie,numero,tipo_comprobante,sunat_cdr,sunat_xml FROM ventas WHERE id=?");
-            $st->execute([$vid]);
-            $v = $st->fetch();
-            if (!$v) continue;
+/*
+ * Endpoint AJAX: un comprobante por request.
+ *
+ * El navegador recorre la selección de a uno y va mostrando el avance. Así no
+ * existe el problema de max_execution_time por más que sean 102, y si algo
+ * falla se ve exactamente en cuál.
+ */
+if (($_GET['ajax'] ?? '') === '1') {
+    header('Content-Type: application/json; charset=utf-8');
 
-            $ref = $v['serie'] . '-' . str_pad((string)$v['numero'], 8, '0', STR_PAD_LEFT);
+    $responder = function(array $data) { echo json_encode($data, JSON_UNESCAPED_UNICODE); exit; };
 
-            // Salvaguarda común: nunca tocar algo ya aceptado de verdad.
-            if (analizarCdr($v['sunat_cdr'])['ambiente'] === 'produccion') {
-                $reporte[] = ['ref' => $ref, 'accion' => $accion, 'ok' => false,
-                              'msg' => 'OMITIDO: ya tiene CDR de producción. Para anularlo se necesita nota de crédito.'];
-                continue;
-            }
+    if (!$sunat_ok)                       $responder(['ok' => false, 'ref' => '-', 'msg' => 'Módulo SUNAT no instalado.', 'fatal' => true]);
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') $responder(['ok' => false, 'ref' => '-', 'msg' => 'Método inválido.', 'fatal' => true]);
+    if (SUNAT_ENDPOINT !== 'produccion')  $responder(['ok' => false, 'ref' => '-', 'msg' => 'La configuración SUNAT sigue en BETA.', 'fatal' => true]);
 
-            if ($pa === 'regenerar') {
-                limpiarRastroSunat($db, $vid);
-                $r = $svc->generarXml($vid);
-                $reporte[] = ['ref' => $ref, 'accion' => $accion, 'ok' => $r['ok'],
-                              'msg' => $r['ok'] ? 'XML regenerado y firmado. Listo para enviar.' : $r['mensaje']];
-                continue;
-            }
+    $accion = $_POST['action'] ?? '';
+    $vid    = (int)($_POST['id'] ?? 0);
+    if (!in_array($accion, ['regenerar', 'enviar'], true) || !$vid) {
+        $responder(['ok' => false, 'ref' => '-', 'msg' => 'Parámetros inválidos.', 'fatal' => true]);
+    }
 
-            // Enviar: exige XML previo, si no no hay nada que mandar.
-            if (empty($v['sunat_xml'])) {
-                $reporte[] = ['ref' => $ref, 'accion' => $accion, 'ok' => false,
-                              'msg' => 'OMITIDO: no tiene XML. Regeneralo primero.'];
-                continue;
-            }
-            $r = $svc->enviarSunat($vid);
-            $reporte[] = ['ref' => $ref, 'accion' => $accion, 'ok' => $r['ok'], 'msg' => $r['mensaje']];
-        }
+    @set_time_limit(120);
+    @ignore_user_abort(true);
+
+    try {
+        $responder(procesarUno($db, new SunatService($db), $accion, $vid));
+    } catch (Throwable $e) {
+        $responder(['ok' => false, 'ref' => "#$vid", 'msg' => 'Excepción: ' . $e->getMessage()]);
     }
 }
 
@@ -215,34 +220,6 @@ if (isset($_SESSION['flash_error'])) {
   <?php endif; ?>
 </div>
 
-<?php if ($reporte): ?>
-<div class="card mb-2" style="padding:16px 18px">
-  <div class="sec-title mb-2">Resultado del reproceso</div>
-  <?php
-    $ok = count(array_filter($reporte, fn($r) => $r['ok']));
-    $ko = count($reporte) - $ok;
-  ?>
-  <div class="flex gap-2 mb-2">
-    <span class="badge b-teal"><?= $ok ?> aceptados</span>
-    <?php if ($ko): ?><span class="badge b-red"><?= $ko ?> con problema</span><?php endif; ?>
-  </div>
-  <div class="table-wrap" style="max-height:320px;overflow:auto">
-    <table class="vtable">
-      <thead><tr><th>Comprobante</th><th>Acción</th><th>Resultado</th></tr></thead>
-      <tbody>
-        <?php foreach ($reporte as $r): ?>
-        <tr>
-          <td class="font-bold" style="font-family:monospace"><?= clean($r['ref']) ?></td>
-          <td><span class="badge b-gray"><?= clean($r['accion'] ?? '—') ?></span></td>
-          <td><span class="badge <?= $r['ok'] ? 'b-teal' : 'b-red' ?>"><?= $r['ok'] ? 'OK' : 'ERROR' ?></span>
-              <span class="text-xs text-muted" style="margin-left:6px"><?= clean($r['msg']) ?></span></td>
-        </tr>
-        <?php endforeach; ?>
-      </tbody>
-    </table>
-  </div>
-</div>
-<?php endif; ?>
 
 <div class="card mb-2" style="padding:16px 18px">
   <div class="sec-title mb-2">Diagnóstico de los <?= count($comprobantes) ?> comprobantes</div>
@@ -287,22 +264,40 @@ if (isset($_SESSION['flash_error'])) {
         <div class="font-bold">Comprobantes reprocesables (<?= count($reprocesables) ?>)</div>
         <div class="text-xs text-muted">Su correlativo sigue libre en producción: se reenvían con la misma serie y número.</div>
       </div>
-      <div class="flex gap-1 flex-wrap">
-        <button type="button" class="btn btn-sm" onclick="marcarPrimeros(<?= LOTE_MAX ?>)">Primeros <?= LOTE_MAX ?></button>
+      <div class="flex gap-1 flex-wrap" id="barraAcciones">
+        <button type="button" class="btn btn-sm" onclick="marcarTodos(true)">Todos</button>
         <button type="button" class="btn btn-sm" onclick="marcarTodos(false)">Ninguno</button>
         <?php $bloqueado = SUNAT_ENDPOINT !== 'produccion' ? 'disabled title="Cambiá la configuración a producción primero"' : ''; ?>
-        <button type="submit" name="action" value="regenerar" class="btn btn-sm" <?= $bloqueado ?>
-          onclick="return confirmarAccion('regenerar')">⚡ Solo regenerar XML</button>
-        <button type="submit" name="action" value="enviar" class="btn btn-sm btn-primary" <?= $bloqueado ?>
-          onclick="return confirmarAccion('enviar')">📤 Enviar a SUNAT</button>
+        <button type="button" class="btn btn-sm btnAccion" <?= $bloqueado ?>
+          onclick="procesar('regenerar')">⚡ Solo regenerar XML</button>
+        <button type="button" class="btn btn-sm btn-primary btnAccion" <?= $bloqueado ?>
+          onclick="procesar('enviar')">📤 Enviar a SUNAT</button>
       </div>
     </div>
     <div style="padding:10px 18px;background:var(--bg3);border-bottom:1px solid var(--border)" class="text-xs text-muted">
       <strong>Son dos pasos.</strong>
       <span style="color:var(--text)">⚡ Regenerar</span> arma y firma el XML de nuevo — <u>no toca SUNAT</u>, podés revisarlo antes.
       <span style="color:var(--text)">📤 Enviar</span> sí emite de verdad, y es irreversible.<br>
-      ⏱ Máximo <strong><?= LOTE_MAX ?></strong> por lote: uno más grande corta por <code>max_execution_time</code>.
-      Si se corta, volvés a entrar y los pendientes siguen listados.
+      Se procesan <strong>de a uno</strong>, con barra de avance. Podés seleccionar los <?= count($reprocesables) ?> sin problema:
+      no hay riesgo de timeout. Si cortás a mitad, los que falten siguen listados al recargar.
+    </div>
+
+    <!-- Panel de progreso -->
+    <div id="panelProgreso" style="display:none;padding:14px 18px;border-bottom:1px solid var(--border)">
+      <div class="flex items-center justify-between mb-2">
+        <div class="font-bold text-sm" id="progTitulo">Procesando…</div>
+        <button type="button" class="btn btn-xs" onclick="detener()" id="btnDetener">✕ Detener</button>
+      </div>
+      <div style="background:var(--bg2);border-radius:999px;height:10px;overflow:hidden;margin-bottom:8px">
+        <div id="progBarra" style="height:100%;width:0%;background:var(--teal-d);transition:width .2s"></div>
+      </div>
+      <div class="flex gap-2 mb-2" style="font-size:12px">
+        <span id="progContador" class="text-muted">0 / 0</span>
+        <span class="badge b-teal" id="progOk">0 OK</span>
+        <span class="badge b-red" id="progErr">0 error</span>
+        <span class="badge b-gray" id="progOmit">0 omitido</span>
+      </div>
+      <div id="progLog" style="max-height:240px;overflow:auto;background:var(--bg3);border-radius:8px;padding:8px;font-family:monospace;font-size:11.5px;line-height:1.7"></div>
     </div>
     <div class="table-wrap">
       <table class="vtable">
@@ -314,9 +309,9 @@ if (isset($_SESSION['flash_error'])) {
           </tr>
         </thead>
         <tbody>
-          <?php foreach ($reprocesables as $i => $v): ?>
-          <tr>
-            <td><input type="checkbox" class="chk" name="ids[]" value="<?= $v['id'] ?>" <?= $i < LOTE_MAX ? 'checked' : '' ?>></td>
+          <?php foreach ($reprocesables as $v): ?>
+          <tr id="fila-<?= $v['id'] ?>">
+            <td><input type="checkbox" class="chk" value="<?= $v['id'] ?>" data-ref="<?= clean($v['serie']) ?>-<?= str_pad((string)$v['numero'],8,'0',STR_PAD_LEFT) ?>"></td>
             <td class="td-main">
               <span class="badge b-gray"><?= strtoupper($v['tipo_comprobante']) ?></span>
               <div style="font-size:12px;margin-top:2px;font-family:monospace"><?= clean($v['serie']) ?>-<?= str_pad((string)$v['numero'],8,'0',STR_PAD_LEFT) ?></div>
@@ -357,34 +352,119 @@ if (isset($_SESSION['flash_error'])) {
 </form>
 
 <script>
-var LOTE_MAX = <?= LOTE_MAX ?>;
+(function(){
+  var URL_AJAX = '<?= BASE_URL ?>/index.php?p=reenvio_sunat&ajax=1';
+  var PAUSA    = <?= PAUSA_MS ?>;
+  var cancelar = false;
+  var corriendo = false;
 
-function marcarTodos(v){ document.querySelectorAll('.chk').forEach(c => c.checked = v); }
-function marcarPrimeros(n){
-  document.querySelectorAll('.chk').forEach((c, i) => c.checked = i < n);
-}
-function confirmarAccion(accion){
-  var n = document.querySelectorAll('.chk:checked').length;
-  if (!n) { alert('No seleccionaste ningún comprobante.'); return false; }
-  if (n > LOTE_MAX) {
-    alert('Seleccionaste ' + n + '. El máximo por lote es ' + LOTE_MAX + ':\n' +
-          'un lote más grande corta por timeout a mitad de camino.');
-    return false;
+  var $ = function(id){ return document.getElementById(id); };
+  var dormir = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
+
+  window.marcarTodos = function(v){
+    if (corriendo) return;
+    document.querySelectorAll('.chk').forEach(function(c){ c.checked = v; });
+  };
+
+  window.detener = function(){
+    cancelar = true;
+    $('btnDetener').textContent = 'Deteniendo…';
+    $('btnDetener').disabled = true;
+  };
+
+  function log(clase, ref, msg){
+    var color = clase === 'ok' ? 'var(--teal-d)' : (clase === 'omit' ? 'var(--text3)' : 'var(--red)');
+    var icono = clase === 'ok' ? '✓' : (clase === 'omit' ? '–' : '✕');
+    var linea = document.createElement('div');
+    linea.style.color = color;
+    linea.textContent = icono + ' ' + ref + '  ' + msg;
+    $('progLog').appendChild(linea);
+    $('progLog').scrollTop = $('progLog').scrollHeight;
   }
 
-  if (accion === 'regenerar') {
-    return confirm('Se va a REGENERAR el XML de ' + n + ' comprobante(s).\n\n' +
+  window.procesar = async function(accion){
+    if (corriendo) return;
+
+    var chks = Array.prototype.slice.call(document.querySelectorAll('.chk:checked'));
+    if (!chks.length) { alert('No seleccionaste ningún comprobante.'); return; }
+
+    var n = chks.length, ok;
+    if (accion === 'regenerar') {
+      ok = confirm('Se va a REGENERAR el XML de ' + n + ' comprobante(s).\n\n' +
                    'Esto NO envía nada a SUNAT: solo arma y firma el XML de nuevo.\n' +
-                   'Podés revisarlo antes de emitir.\n\n' +
-                   '¿Continuar?');
-  }
+                   'Podés revisarlo antes de emitir.\n\n¿Continuar?');
+    } else {
+      ok = confirm('Se van a ENVIAR ' + n + ' comprobante(s) a SUNAT PRODUCCIÓN.\n\n' +
+                   'Esta operación es REAL y no se puede deshacer:\n' +
+                   'una vez aceptados, solo se anulan con nota de crédito.\n\n' +
+                   'NO cierres la pestaña mientras avanza.\n\n¿Confirmás?');
+    }
+    if (!ok) return;
 
-  return confirm('Se van a ENVIAR ' + n + ' comprobante(s) a SUNAT PRODUCCIÓN.\n\n' +
-                 'Esta operación es REAL y no se puede deshacer:\n' +
-                 'una vez aceptados, solo se anulan con nota de crédito.\n\n' +
-                 'Puede tardar hasta un minuto. NO cierres la pestaña.\n\n' +
-                 '¿Confirmás?');
-}
+    corriendo = true; cancelar = false;
+    document.querySelectorAll('.btnAccion').forEach(function(b){ b.disabled = true; });
+    $('btnDetener').disabled = false;
+    $('btnDetener').textContent = '✕ Detener';
+    $('panelProgreso').style.display = 'block';
+    $('progLog').innerHTML = '';
+    $('progTitulo').textContent = (accion === 'regenerar' ? 'Regenerando XML' : 'Enviando a SUNAT') + '…';
+
+    var nOk = 0, nErr = 0, nOmit = 0, i = 0;
+
+    for (i = 0; i < chks.length; i++) {
+      if (cancelar) { log('omit', '—', 'Detenido por el usuario. ' + (chks.length - i) + ' sin procesar.'); break; }
+
+      var chk = chks[i];
+      var ref = chk.dataset.ref || ('#' + chk.value);
+      var fila = $('fila-' + chk.value);
+      if (fila) fila.style.background = 'rgba(30,168,161,.10)';
+
+      try {
+        var fd = new FormData();
+        fd.append('action', accion);
+        fd.append('id', chk.value);
+        var resp = await fetch(URL_AJAX, { method:'POST', body: fd, credentials:'same-origin' });
+        var txt  = await resp.text();
+        var r;
+        try { r = JSON.parse(txt); }
+        catch (e) { r = { ok:false, ref:ref, msg:'Respuesta no-JSON (HTTP ' + resp.status + '): ' + txt.slice(0,120) }; }
+
+        if (r.fatal) { log('err', r.ref || ref, r.msg); alert('Se detuvo: ' + r.msg); break; }
+
+        if (r.ok)            { nOk++;   log('ok',   r.ref || ref, r.msg); chk.checked = false; }
+        else if (r.omitido)  { nOmit++; log('omit', r.ref || ref, r.msg); chk.checked = false; }
+        else                 { nErr++;  log('err',  r.ref || ref, r.msg); }
+      } catch (e) {
+        nErr++; log('err', ref, 'Error de red: ' + e.message);
+      }
+
+      if (fila) fila.style.background = '';
+      var hechos = i + 1;
+      $('progBarra').style.width = (hechos / chks.length * 100) + '%';
+      $('progContador').textContent = hechos + ' / ' + chks.length;
+      $('progOk').textContent   = nOk + ' OK';
+      $('progErr').textContent  = nErr + ' error';
+      $('progOmit').textContent = nOmit + ' omitido';
+
+      if (hechos < chks.length) await dormir(PAUSA);
+    }
+
+    corriendo = false;
+    $('btnDetener').disabled = true;
+    $('progTitulo').textContent = 'Terminado — ' + nOk + ' OK, ' + nErr + ' error, ' + nOmit + ' omitido';
+    document.querySelectorAll('.btnAccion').forEach(function(b){ b.disabled = false; });
+
+    var aviso = document.createElement('div');
+    aviso.style.marginTop = '10px';
+    aviso.innerHTML = '<button type="button" class="btn btn-sm btn-primary" onclick="location.reload()">🔄 Recargar para ver el estado actualizado</button>';
+    $('panelProgreso').appendChild(aviso);
+  };
+
+  // Evita perder el proceso a mitad de camino por un clic distraído.
+  window.addEventListener('beforeunload', function(e){
+    if (corriendo) { e.preventDefault(); e.returnValue = ''; }
+  });
+})();
 </script>
 <?php else: ?>
   <div class="card" style="padding:24px;text-align:center" class="text-muted">
