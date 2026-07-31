@@ -386,19 +386,86 @@ try {
 } catch(Exception $e) { $petshop_sel = []; }
 
 // ─── LISTA DE VENTAS ────────────────────────────────────────────
-$search  = trim($_GET['q']  ?? '');
+$search   = trim($_GET['q']  ?? '');
 $estado_f = $_GET['estado'] ?? '';
+$tipo_f   = $_GET['tipo']   ?? '';
+$sunat_f  = $_GET['sunat_e'] ?? '';
+$metodo_f = trim($_GET['metodo'] ?? '');
 $fecha_d  = $_GET['fecha_d'] ?? date('Y-m-01');
 $fecha_h  = $_GET['fecha_h'] ?? date('Y-m-d');
+
 $where  = "v.fecha BETWEEN ? AND ?";
 $params = [$fecha_d.' 00:00:00', $fecha_h.' 23:59:59'];
-if ($estado_f) { $where .= " AND v.estado=?"; $params[]=$estado_f; }
-if ($search)   { $where .= " AND (c.nombre LIKE ? OR v.serie LIKE ? OR CAST(v.numero AS CHAR) LIKE ?)"; $like="%$search%"; $params=array_merge($params,[$like,$like,$like]); }
+
+if ($estado_f) { $where .= " AND v.estado=?"; $params[] = $estado_f; }
+
+if (in_array($tipo_f, ['boleta','factura','ticket'], true)) {
+    $where .= " AND v.tipo_comprobante=?"; $params[] = $tipo_f;
+}
+
+// 'sin_enviar' agrupa los que nunca salieron a SUNAT (columna en NULL).
+if ($sunat_f === 'sin_enviar') {
+    $where .= " AND v.sunat_estado IS NULL";
+} elseif (in_array($sunat_f, ['pendiente','aceptado','rechazado'], true)) {
+    $where .= " AND v.sunat_estado=?"; $params[] = $sunat_f;
+}
+
+/* Los pagos mixtos se guardan concatenados ("efectivo + yape", ver línea ~163),
+   así que un igual exacto los dejaría afuera. Con LIKE, filtrar por "yape"
+   also trae las ventas donde yape fue parte del pago. */
+if ($metodo_f !== '') {
+    $where .= " AND v.metodo_pago LIKE ?";
+    $params[] = '%' . str_replace(['\\','%','_'], ['\\\\','\%','\_'], $metodo_f) . '%';
+}
+
+if ($search) {
+    $where .= " AND (c.nombre LIKE ? OR v.serie LIKE ? OR CAST(v.numero AS CHAR) LIKE ?)";
+    // Escapa los comodines para que un "%" escrito por el usuario se busque
+    // literal en vez de traer todo el listado.
+    $like = '%' . str_replace(['\\','%','_'], ['\\\\','\%','\_'], $search) . '%';
+    $params = array_merge($params, [$like, $like, $like]);
+}
 // Filtro por sede (sin afectar lógica SUNAT)
 if (!verTodasSedes()) { $where .= " AND v.sede_id=" . getSede(); }
-$ventas = $db->prepare("SELECT v.*,c.nombre as cliente,m.nombre as mascota FROM ventas v JOIN clientes c ON c.id=v.cliente_id LEFT JOIN mascotas m ON m.id=v.mascota_id WHERE $where ORDER BY v.fecha DESC LIMIT 100");
-$ventas->execute($params); $ventas=$ventas->fetchAll();
-$total_periodo = array_sum(array_column(array_filter($ventas,fn($v)=>$v['estado']==='pagado'),'total'));
+
+$LIMITE = 100;
+$ventas = $db->prepare("SELECT v.*,c.nombre as cliente,m.nombre as mascota FROM ventas v JOIN clientes c ON c.id=v.cliente_id LEFT JOIN mascotas m ON m.id=v.mascota_id WHERE $where ORDER BY v.fecha DESC LIMIT $LIMITE");
+$ventas->execute($params); $ventas = $ventas->fetchAll();
+
+/* Los totales se calculan sobre TODO el filtro, no sobre las 100 filas que se
+   muestran: sumarlos desde $ventas daba cifras cortadas cuando el período
+   tenía más comprobantes que el límite. */
+$resumen = $db->prepare("
+    SELECT COUNT(*) AS n,
+           COALESCE(SUM(CASE WHEN v.estado='pagado'    THEN v.total ELSE 0 END),0) AS total_pagado,
+           COALESCE(SUM(v.estado='pagado'),0)    AS n_pagados,
+           COALESCE(SUM(v.estado='pendiente'),0) AS n_pendientes,
+           COALESCE(SUM(v.estado='anulado'),0)   AS n_anulados
+    FROM ventas v JOIN clientes c ON c.id=v.cliente_id
+    WHERE $where
+");
+$resumen->execute($params);
+$res = $resumen->fetch() ?: ['n'=>0,'total_pagado'=>0,'n_pagados'=>0,'n_pendientes'=>0,'n_anulados'=>0];
+
+$total_periodo  = (float)$res['total_pagado'];
+$total_filtrado = (int)$res['n'];
+$hay_filtros    = ($search !== '' || $estado_f !== '' || $tipo_f !== '' || $sunat_f !== '' || $metodo_f !== '');
+
+/* Opciones del filtro de método tomadas de lo REALMENTE guardado: el catálogo
+   `metodos_pago` usa nombres con mayúscula ("Yape") y las ventas guardan otra
+   forma, así que armar el select desde el catálogo daba filtros que no
+   coincidían con nada. Los mixtos se parten para ofrecer cada método suelto. */
+$metodos_en_uso = [];
+try {
+    foreach ($db->query("SELECT DISTINCT metodo_pago FROM ventas WHERE metodo_pago IS NOT NULL AND metodo_pago<>''") as $r) {
+        foreach (explode('+', $r['metodo_pago']) as $parte) {
+            $parte = trim($parte);
+            if ($parte !== '') $metodos_en_uso[$parte] = true;
+        }
+    }
+    $metodos_en_uso = array_keys($metodos_en_uso);
+    sort($metodos_en_uso);
+} catch (Exception $e) { $metodos_en_uso = []; }
 ?>
 
 <?php if(($msg??'')==='error_items'): ?>
@@ -921,26 +988,88 @@ if (isset($_SESSION['flash_error'])) {
 <!-- ════════════════════════════ LISTA ════════════════════════════ -->
 <div class="grid g4 mb-2">
   <div class="stat-card"><div class="stat-icon si-teal">💰</div><div class="stat-value">S/. <?= number_format($total_periodo,0) ?></div><div class="stat-label">Ingresos del período</div></div>
-  <div class="stat-card"><div class="stat-icon si-blue">🧾</div><div class="stat-value"><?= count($ventas) ?></div><div class="stat-label">Comprobantes</div></div>
-  <div class="stat-card"><div class="stat-icon si-teal">✅</div><div class="stat-value"><?= count(array_filter($ventas,fn($v)=>$v['estado']==='pagado')) ?></div><div class="stat-label">Pagados</div></div>
-  <div class="stat-card"><div class="stat-icon si-amber">⏳</div><div class="stat-value"><?= count(array_filter($ventas,fn($v)=>$v['estado']==='pendiente')) ?></div><div class="stat-label">Pendientes</div></div>
+  <div class="stat-card"><div class="stat-icon si-blue">🧾</div><div class="stat-value"><?= $total_filtrado ?></div><div class="stat-label">Comprobantes</div></div>
+  <div class="stat-card"><div class="stat-icon si-teal">✅</div><div class="stat-value"><?= (int)$res['n_pagados'] ?></div><div class="stat-label">Pagados</div></div>
+  <div class="stat-card"><div class="stat-icon si-amber">⏳</div><div class="stat-value"><?= (int)$res['n_pendientes'] ?></div><div class="stat-label">Pendientes</div></div>
 </div>
 <div class="card mb-2" style="padding:14px 18px">
   <form method="GET" class="flex items-center gap-2" style="flex-wrap:wrap">
     <input type="hidden" name="p" value="facturacion">
-    <input class="form-input" name="q" value="<?= clean($search) ?>" placeholder="Buscar cliente, serie..." style="width:220px">
-    <input class="form-input" type="date" name="fecha_d" value="<?= $fecha_d ?>" style="width:150px">
-    <input class="form-input" type="date" name="fecha_h" value="<?= $fecha_h ?>" style="width:150px">
-    <select class="form-input" name="estado" style="width:140px">
-      <option value="">Todos</option>
+    <input class="form-input" name="q" value="<?= clean($search) ?>" placeholder="Buscar cliente, serie..." style="width:200px">
+
+    <input class="form-input" type="date" name="fecha_d" value="<?= clean($fecha_d) ?>" style="width:150px" title="Desde">
+    <input class="form-input" type="date" name="fecha_h" value="<?= clean($fecha_h) ?>" style="width:150px" title="Hasta">
+
+    <select class="form-input" name="tipo" style="width:130px" title="Tipo de comprobante">
+      <option value="">Todo tipo</option>
+      <option value="boleta"  <?= $tipo_f==='boleta' ?'selected':'' ?>>Boleta</option>
+      <option value="factura" <?= $tipo_f==='factura'?'selected':'' ?>>Factura</option>
+      <option value="ticket"  <?= $tipo_f==='ticket' ?'selected':'' ?>>Ticket</option>
+    </select>
+
+    <select class="form-input" name="estado" style="width:130px" title="Estado de la venta">
+      <option value="">Todo estado</option>
       <option value="pagado"   <?= $estado_f==='pagado'   ?'selected':'' ?>>Pagado</option>
       <option value="pendiente"<?= $estado_f==='pendiente'?'selected':'' ?>>Pendiente</option>
       <option value="anulado"  <?= $estado_f==='anulado'  ?'selected':'' ?>>Anulado</option>
     </select>
+
+    <select class="form-input" name="sunat_e" style="width:150px" title="Estado ante SUNAT">
+      <option value="">Todo SUNAT</option>
+      <option value="aceptado"   <?= $sunat_f==='aceptado'  ?'selected':'' ?>>SUNAT: Aceptado</option>
+      <option value="rechazado"  <?= $sunat_f==='rechazado' ?'selected':'' ?>>SUNAT: Rechazado</option>
+      <option value="pendiente"  <?= $sunat_f==='pendiente' ?'selected':'' ?>>SUNAT: Pendiente</option>
+      <option value="sin_enviar" <?= $sunat_f==='sin_enviar'?'selected':'' ?>>Sin enviar</option>
+    </select>
+
+    <?php if ($metodos_en_uso): ?>
+    <select class="form-input" name="metodo" style="width:150px" title="Método de pago (incluye pagos mixtos)">
+      <option value="">Todo método</option>
+      <?php foreach ($metodos_en_uso as $mp): ?>
+        <option value="<?= clean($mp) ?>" <?= $metodo_f===$mp?'selected':'' ?>><?= clean(ucfirst(str_replace('_',' ',$mp))) ?></option>
+      <?php endforeach; ?>
+    </select>
+    <?php endif; ?>
+
     <button type="submit" class="btn">Filtrar</button>
+    <?php if ($hay_filtros): ?>
+      <a href="?p=facturacion&fecha_d=<?= clean($fecha_d) ?>&fecha_h=<?= clean($fecha_h) ?>" class="btn btn-xs" title="Quitar filtros y dejar solo el rango de fechas">✕ Limpiar</a>
+    <?php endif; ?>
+
     <a href="?p=facturacion&action=nueva" class="btn btn-primary" style="margin-left:auto">+ Nueva Venta</a>
     <a href="?p=plantillas" class="btn" title="Plantillas de impresión">🖨️ Plantillas</a>
   </form>
+
+  <!-- Atajos de rango: lo que más se usa a diario -->
+  <div class="flex gap-1 mt-2" style="flex-wrap:wrap">
+    <?php
+      $qs = function(array $extra) use ($search,$estado_f,$tipo_f,$sunat_f,$metodo_f) {
+          return '?' . http_build_query(array_merge([
+              'p'=>'facturacion','q'=>$search,'estado'=>$estado_f,
+              'tipo'=>$tipo_f,'sunat_e'=>$sunat_f,'metodo'=>$metodo_f,
+          ], $extra));
+      };
+      $rangos = [
+        'Hoy'          => [date('Y-m-d'), date('Y-m-d')],
+        'Ayer'         => [date('Y-m-d', strtotime('-1 day')), date('Y-m-d', strtotime('-1 day'))],
+        'Últimos 7 d.' => [date('Y-m-d', strtotime('-6 days')), date('Y-m-d')],
+        'Este mes'     => [date('Y-m-01'), date('Y-m-d')],
+        'Mes pasado'   => [date('Y-m-01', strtotime('first day of last month')), date('Y-m-t', strtotime('last day of last month'))],
+      ];
+      foreach ($rangos as $lbl => [$d, $h]):
+        $activo = ($fecha_d === $d && $fecha_h === $h);
+    ?>
+      <a href="<?= $qs(['fecha_d'=>$d,'fecha_h'=>$h]) ?>" class="btn btn-xs<?= $activo ? ' btn-primary' : '' ?>"><?= $lbl ?></a>
+    <?php endforeach; ?>
+
+    <span class="text-xs text-muted" style="margin-left:auto;align-self:center">
+      <?php if ($total_filtrado > $LIMITE): ?>
+        Mostrando <?= $LIMITE ?> de <strong><?= $total_filtrado ?></strong> — afiná el filtro para ver el resto
+      <?php else: ?>
+        <?= $total_filtrado ?> comprobante<?= $total_filtrado === 1 ? '' : 's' ?>
+      <?php endif; ?>
+    </span>
+  </div>
 </div>
 <div class="card" style="padding:0">
   <div class="table-wrap">
