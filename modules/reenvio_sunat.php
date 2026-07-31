@@ -16,7 +16,32 @@ $pageTitle = 'Reenvío SUNAT';
 $db        = getDB();
 $user      = getUser();
 
-// Reprocesar comprobantes fiscales es operación de administrador.
+/*
+ * CANDADO 1 — llave en la URL.
+ *
+ * El módulo no figura en el menú y sin `?key=` correcto responde 404, igual que
+ * una página inexistente: nadie puede toparse con él navegando, ni siquiera con
+ * cuenta de admin. Se entra únicamente con el link completo.
+ *
+ * La llave viaja en la sesión para que el POST del AJAX no tenga que repetirla.
+ * hash_equals compara en tiempo constante (evita adivinarla midiendo demoras).
+ */
+$__llave = (string)($_GET['key'] ?? '');
+if ($__llave !== '' && defined('MANTENIMIENTO_TOKEN') && hash_equals(MANTENIMIENTO_TOKEN, $__llave)) {
+    $_SESSION['mant_sunat_ok'] = true;
+}
+if (empty($_SESSION['mant_sunat_ok'])) {
+    http_response_code(404);
+    exit('404 Not Found');
+}
+
+// Salida explícita del modo mantenimiento (además de cerrar sesión).
+if (($_GET['salir'] ?? '') === '1') {
+    unset($_SESSION['mant_sunat_ok']);
+    header('Location: ' . BASE_URL . '/index.php?p=dashboard'); exit;
+}
+
+// CANDADO 2 — además, tiene que ser admin.
 if (!hasRole(['admin']) || !canView('facturacion')) {
     $_SESSION['flash_error'] = 'Solo un administrador puede reprocesar comprobantes.';
     header('Location: ' . BASE_URL . '/index.php?p=dashboard'); exit;
@@ -204,7 +229,10 @@ if (isset($_SESSION['flash_error'])) {
 <?php else: ?>
 
 <div class="card mb-2" style="padding:16px 18px">
-  <div class="sec-title mb-2">Estado de la configuración SUNAT</div>
+  <div class="flex items-center justify-between mb-2">
+    <div class="sec-title">Estado de la configuración SUNAT</div>
+    <a href="?p=reenvio_sunat&salir=1" class="btn btn-xs" title="Cerrar el acceso; para volver hace falta el link con la llave">🔒 Salir de mantenimiento</a>
+  </div>
   <div class="flex gap-2 flex-wrap" style="font-size:13px">
     <span class="badge <?= SUNAT_ENDPOINT === 'produccion' ? 'b-teal' : 'b-red' ?>">
       Modo: <?= strtoupper(SUNAT_ENDPOINT) ?>

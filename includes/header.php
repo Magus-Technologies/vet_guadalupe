@@ -95,10 +95,8 @@ $nav = [
   ['icon'=>'⚙️', 'label'=>'Configuración',     'page'=>'configuracion',  'section'=>''],
 ];
 
-// Herramienta de recuperación: solo admin la ve.
-if (function_exists('hasRole') && hasRole(['admin'])) {
-    $nav[] = ['icon'=>'♻️', 'label'=>'Reenvío SUNAT', 'page'=>'reenvio_sunat', 'section'=>''];
-}
+/* El módulo de mantenimiento SUNAT NO se lista en el menú a propósito: se entra
+   solo con el link que lleva MANTENIMIENTO_TOKEN. Ver modules/reenvio_sunat.php */
 ?>
 <!DOCTYPE html>
 <html lang="es">

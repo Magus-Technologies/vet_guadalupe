@@ -23,6 +23,7 @@ if ($__isLocal) {
     define('BASE_URL', 'http://localhost/vetPro');
     define('APP_ENV',  'development');
     define('MIGRATIONS_TOKEN', 'dev_local_token_no_importa');
+    define('MANTENIMIENTO_TOKEN', 'dev_local_token_no_importa');
 } else {
     // ════════ PRODUCCIÓN ════════
     define('DB_HOST', 'localhost');
@@ -32,6 +33,9 @@ if ($__isLocal) {
     define('BASE_URL', 'https://magus-ecommerce.com/vet_guadalupe');
     define('APP_ENV',  'production');
     define('MIGRATIONS_TOKEN', 'CAMBIAR_POR_TOKEN_LARGO_Y_ALEATORIO');
+    // Llave del módulo de mantenimiento SUNAT. Sin ella el módulo no existe:
+    // no figura en el menú y responde 404 aunque entres con cuenta de admin.
+    define('MANTENIMIENTO_TOKEN', 'b4cd29f935b093602767da483a14c2749f6a8536cca7f270');
 }
 
 define('DB_CHARSET',   'utf8mb4');
