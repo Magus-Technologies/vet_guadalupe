@@ -82,6 +82,11 @@ $nav = [
   ['icon'=>'🏢', 'label'=>'Multi-Sede',        'page'=>'sedes',          'section'=>''],
   ['icon'=>'⚙️', 'label'=>'Configuración',     'page'=>'configuracion',  'section'=>''],
 ];
+
+// Herramienta de recuperación: solo admin la ve.
+if (function_exists('hasRole') && hasRole(['admin'])) {
+    $nav[] = ['icon'=>'♻️', 'label'=>'Reenvío SUNAT', 'page'=>'reenvio_sunat', 'section'=>''];
+}
 ?>
 <!DOCTYPE html>
 <html lang="es">

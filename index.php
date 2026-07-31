@@ -9,7 +9,7 @@ $allowed = [
   'cirugias','hospital',
   'grooming','petshop',
   'farmacia','inventario',
-  'facturacion','plantillas','caja','personal','reportes',
+  'facturacion','reenvio_sunat','plantillas','caja','personal','reportes',
   'whatsapp','portal','buscar',
   'ganado','permisos','calendario','sedes','compras','configuracion',
   'whatsapp_conexion','reporte_pagos','cuentas','movimientos'
@@ -17,7 +17,8 @@ $allowed = [
 if (!in_array($p, $allowed)) $p = 'dashboard';
 
 // Verificar permiso de acceso al módulo
-$modulos_sin_permiso = ['portal','buscar','evolucion','whatsapp_conexion']; // módulos sin restricción específica
+// 'reenvio_sunat' valida admin + canView('facturacion') internamente.
+$modulos_sin_permiso = ['portal','buscar','evolucion','whatsapp_conexion','reenvio_sunat'];
 if (!in_array($p, $modulos_sin_permiso) && $p !== 'dashboard') {
     if (!canView($p)) {
         // Mostrar página de acceso denegado
