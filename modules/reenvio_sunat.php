@@ -27,6 +27,10 @@ $sunat_svc = __DIR__ . '/../includes/sunat/SunatService.php';
 $sunat_ok  = file_exists($sunat_cfg) && file_exists($sunat_svc);
 if ($sunat_ok) { require_once $sunat_cfg; require_once $sunat_svc; }
 
+// Tamaño máximo de lote. Cada comprobante son 2 llamadas HTTP a SUNAT: un lote
+// grande agota max_execution_time y corta a mitad de camino.
+define('LOTE_MAX', 15);
+
 /**
  * Abre el CDR guardado y devuelve cómo lo firmó SUNAT.
  *
@@ -104,6 +108,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $sunat_ok) {
             header('Location: ' . BASE_URL . '/index.php?p=reenvio_sunat'); exit;
         }
 
+        if (count($ids) > LOTE_MAX) {
+            $_SESSION['flash_error'] = 'Seleccionaste ' . count($ids) . ' comprobantes. El máximo por lote es ' . LOTE_MAX . ' para no cortar por timeout.';
+            header('Location: ' . BASE_URL . '/index.php?p=reenvio_sunat'); exit;
+        }
+
+        // Cada llamada a SUNAT puede tardar varios segundos.
+        @set_time_limit(0);
+        @ignore_user_abort(true);
+
         $svc = new SunatService($db);
         foreach ($ids as $vid) {
             $st = $db->prepare("SELECT id,serie,numero,tipo_comprobante,sunat_cdr FROM ventas WHERE id=?");
@@ -150,6 +163,17 @@ foreach ($comprobantes as &$v) {
     $grupos[$v['_cdr']['ambiente']][] = $v;
 }
 unset($v);
+
+/*
+ * Reprocesables = los de beta + los que quedaron sin CDR.
+ *
+ * "Sin CDR" cubre dos casos que se reintentan igual: el que nunca se envió, y
+ * el que quedó a medio camino porque PHP cortó por timeout entre el limpiado y
+ * el envío. Sin incluirlos acá, un corte a mitad de lote los dejaba invisibles.
+ * Lo que jamás entra es un comprobante con CDR de producción.
+ */
+$reprocesables = array_merge($grupos['beta'], $grupos['sin_cdr']);
+usort($reprocesables, fn($a, $b) => [$a['serie'], (int)$a['numero']] <=> [$b['serie'], (int)$b['numero']]);
 
 require_once __DIR__ . '/../includes/header.php';
 
@@ -211,17 +235,17 @@ if (isset($_SESSION['flash_error'])) {
 <div class="card mb-2" style="padding:16px 18px">
   <div class="sec-title mb-2">Diagnóstico de los <?= count($comprobantes) ?> comprobantes</div>
   <div class="flex gap-2 flex-wrap">
-    <span class="badge b-red"><?= count($grupos['beta']) ?> emitidos en BETA (reprocesables)</span>
+    <span class="badge b-red"><?= count($grupos['beta']) ?> emitidos en BETA</span>
+    <span class="badge b-amber"><?= count($grupos['sin_cdr']) ?> sin CDR (nunca enviados o cortados a medio envío)</span>
     <span class="badge b-teal"><?= count($grupos['produccion']) ?> en producción (intocables)</span>
-    <span class="badge b-amber"><?= count($grupos['sin_cdr']) ?> sin CDR</span>
     <?php if ($grupos['ilegible']): ?><span class="badge b-gray"><?= count($grupos['ilegible']) ?> CDR ilegible</span><?php endif; ?>
   </div>
 
-  <?php if ($grupos['beta']):
+  <?php if ($reprocesables):
     // Reparto por antigüedad. El plazo exacto lo define la normativa vigente y
     // difiere entre boleta y factura: acá solo se expone el dato en crudo.
     $ant = ['0-3' => 0, '4-7' => 0, '8+' => 0];
-    foreach ($grupos['beta'] as $b) {
+    foreach ($reprocesables as $b) {
         $d = (int)floor((time() - strtotime($b['fecha'])) / 86400);
         if ($d <= 3)      $ant['0-3']++;
         elseif ($d <= 7)  $ant['4-7']++;
@@ -229,7 +253,7 @@ if (isset($_SESSION['flash_error'])) {
     }
   ?>
   <div class="mt-3" style="border-top:1px solid var(--border);padding-top:12px">
-    <div class="text-xs text-muted mb-2">ANTIGÜEDAD DE LOS COMPROBANTES EN BETA</div>
+    <div class="text-xs text-muted mb-2">ANTIGÜEDAD DE LOS <?= count($reprocesables) ?> REPROCESABLES</div>
     <div class="flex gap-2 flex-wrap">
       <span class="badge b-teal"><?= $ant['0-3'] ?> con 0–3 días</span>
       <span class="badge b-amber"><?= $ant['4-7'] ?> con 4–7 días</span>
@@ -243,22 +267,27 @@ if (isset($_SESSION['flash_error'])) {
   <?php endif; ?>
 </div>
 
-<?php if ($grupos['beta']): ?>
+<?php if ($reprocesables): ?>
 <form method="POST">
   <input type="hidden" name="action" value="reprocesar">
   <div class="card" style="padding:0">
     <div style="padding:14px 18px;border-bottom:1px solid var(--border)" class="flex items-center justify-between">
       <div>
-        <div class="font-bold">Comprobantes emitidos contra BETA</div>
+        <div class="font-bold">Comprobantes reprocesables (<?= count($reprocesables) ?>)</div>
         <div class="text-xs text-muted">Su correlativo sigue libre en producción: se reenvían con la misma serie y número.</div>
       </div>
       <div class="flex gap-1">
-        <button type="button" class="btn btn-sm" onclick="marcarTodos(true)">Seleccionar todos</button>
+        <button type="button" class="btn btn-sm" onclick="marcarPrimeros(<?= LOTE_MAX ?>)">Primeros <?= LOTE_MAX ?></button>
         <button type="button" class="btn btn-sm" onclick="marcarTodos(false)">Ninguno</button>
         <button type="submit" class="btn btn-sm btn-primary"
           <?= SUNAT_ENDPOINT !== 'produccion' ? 'disabled title="Cambiá la configuración a producción primero"' : '' ?>
           onclick="return confirmarEnvio()">📤 Regenerar y enviar</button>
       </div>
+    </div>
+    <div style="padding:10px 18px;background:var(--bg3);border-bottom:1px solid var(--border)" class="text-xs text-muted">
+      ⏱ Cada comprobante son 2 llamadas a SUNAT. Enviá de a <strong><?= LOTE_MAX ?></strong> como máximo:
+      un lote más grande corta por <code>max_execution_time</code> a mitad de camino.
+      Si se corta, no pasa nada — volvés a entrar y los pendientes siguen acá.
     </div>
     <div class="table-wrap">
       <table class="vtable">
@@ -270,9 +299,9 @@ if (isset($_SESSION['flash_error'])) {
           </tr>
         </thead>
         <tbody>
-          <?php foreach ($grupos['beta'] as $v): ?>
+          <?php foreach ($reprocesables as $i => $v): ?>
           <tr>
-            <td><input type="checkbox" class="chk" name="ids[]" value="<?= $v['id'] ?>" checked></td>
+            <td><input type="checkbox" class="chk" name="ids[]" value="<?= $v['id'] ?>" <?= $i < LOTE_MAX ? 'checked' : '' ?>></td>
             <td class="td-main">
               <span class="badge b-gray"><?= strtoupper($v['tipo_comprobante']) ?></span>
               <div style="font-size:12px;margin-top:2px;font-family:monospace"><?= clean($v['serie']) ?>-<?= str_pad((string)$v['numero'],8,'0',STR_PAD_LEFT) ?></div>
@@ -287,7 +316,13 @@ if (isset($_SESSION['flash_error'])) {
             ?>
             <td><span class="badge <?= $dCl ?>"><?= $dias ?> día<?= $dias === 1 ? '' : 's' ?></span></td>
             <td style="text-align:right" class="font-bold">S/. <?= number_format($v['total'],2) ?></td>
-            <td><span class="badge b-red"><span class="dot"></span>BETA</span></td>
+            <td>
+              <?php if ($v['_cdr']['ambiente'] === 'beta'): ?>
+                <span class="badge b-red"><span class="dot"></span>BETA</span>
+              <?php else: ?>
+                <span class="badge b-amber"><span class="dot"></span>SIN CDR</span>
+              <?php endif; ?>
+            </td>
           </tr>
           <?php endforeach; ?>
         </tbody>
@@ -297,12 +332,23 @@ if (isset($_SESSION['flash_error'])) {
 </form>
 
 <script>
+var LOTE_MAX = <?= LOTE_MAX ?>;
+
 function marcarTodos(v){ document.querySelectorAll('.chk').forEach(c => c.checked = v); }
+function marcarPrimeros(n){
+  document.querySelectorAll('.chk').forEach((c, i) => c.checked = i < n);
+}
 function confirmarEnvio(){
   var n = document.querySelectorAll('.chk:checked').length;
   if (!n) { alert('No seleccionaste ningún comprobante.'); return false; }
+  if (n > LOTE_MAX) {
+    alert('Seleccionaste ' + n + '. El máximo por lote es ' + LOTE_MAX + ':\n' +
+          'un lote más grande corta por timeout a mitad de envío.');
+    return false;
+  }
   return confirm('Se van a REGENERAR y ENVIAR ' + n + ' comprobante(s) a SUNAT PRODUCCIÓN.\n\n' +
                  'Esta operación es real y no se puede deshacer: una vez aceptados, solo se anulan con nota de crédito.\n\n' +
+                 'Puede tardar hasta un minuto. NO cierres la pestaña.\n\n' +
                  '¿Confirmás?');
 }
 </script>
