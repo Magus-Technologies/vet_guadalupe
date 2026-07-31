@@ -9,7 +9,7 @@ $allowed = [
   'cirugias','hospital',
   'grooming','petshop','servicios','solicitudes',
   'farmacia','inventario',
-  'facturacion','notas_credito','plantillas','caja','personal','reportes',
+  'facturacion','notas_credito','reenvio_sunat','plantillas','caja','personal','reportes',
   'whatsapp','portal','buscar',
   'ganado','permisos','calendario','sedes','compras','configuracion',
   'whatsapp_conexion','reporte_pagos','cuentas','movimientos'
@@ -18,7 +18,7 @@ if (!in_array($p, $allowed)) $p = 'dashboard';
 
 // Verificar permiso de acceso al módulo
 // Módulos sin permiso propio. `notas_credito` valida canView('facturacion') internamente.
-$modulos_sin_permiso = ['portal','buscar','evolucion','whatsapp_conexion','triaje','notas_credito'];
+$modulos_sin_permiso = ['portal','buscar','evolucion','whatsapp_conexion','triaje','notas_credito','reenvio_sunat'];
 if (!in_array($p, $modulos_sin_permiso)) {
     if (!canView($p)) {
         // Si no puede ver el dashboard tampoco, mandarlo al primer módulo permitido (evita bucle)
