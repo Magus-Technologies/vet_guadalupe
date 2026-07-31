@@ -46,17 +46,32 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $data=[]; foreach($fields as $f) $data[$f]=trim($_POST[$f]??'')?:null;
     $data['consentimiento_firmado'] = isset($_POST['consentimiento_firmado'])?1:0;
     $data['firma_digital'] = trim($_POST['firma_digital']??'');
-    $data['sede_id'] = $user['sede_id']??1;
-    if ($id) {
-      $sets = implode(',',array_map(fn($f)=>"$f=:$f",$fields));
-      $sets .= ",consentimiento_firmado=:consentimiento_firmado,firma_digital=:firma_digital";
-      $st=$db->prepare("UPDATE cirugias SET $sets WHERE id=:id"); $data['id']=$id;
+    // datetime-local manda "2026-06-25T11:30" -> normalizar a "2026-06-25 11:30"
+    if (!empty($data['fecha_programada'])) $data['fecha_programada'] = str_replace('T',' ',$data['fecha_programada']);
+
+    // Validar obligatorios (columnas NOT NULL / FK) para no reventar en SQL
+    if (empty($data['mascota_id']) || empty($data['veterinario_id']) || empty($data['tipo_cirugia']) || empty($data['fecha_programada'])) {
+      $msg='error_req';
     } else {
-      $allf = array_merge($fields,['consentimiento_firmado','firma_digital','sede_id']);
-      $cols=implode(',',$allf); $pls=implode(',',array_map(fn($f)=>":$f",$allf));
-      $st=$db->prepare("INSERT INTO cirugias ($cols) VALUES ($pls)");
+      try {
+        if ($id) {
+          // UPDATE: NO se incluye sede_id (no está en el SET) para que coincidan los parámetros
+          $sets = implode(',',array_map(fn($f)=>"$f=:$f",$fields));
+          $sets .= ",consentimiento_firmado=:consentimiento_firmado,firma_digital=:firma_digital";
+          $st=$db->prepare("UPDATE cirugias SET $sets WHERE id=:id");
+          $data['id']=$id;
+          $st->execute($data);
+        } else {
+          $data['sede_id'] = $user['sede_id']??1;
+          $allf = array_merge($fields,['consentimiento_firmado','firma_digital','sede_id']);
+          $cols=implode(',',$allf); $pls=implode(',',array_map(fn($f)=>":$f",$allf));
+          $db->prepare("INSERT INTO cirugias ($cols) VALUES ($pls)")->execute($data);
+        }
+        $msg='success'; $action='list';
+      } catch (Exception $e) {
+        $msg='error_db';
+      }
     }
-    $st->execute($data); $msg='success'; $action='list';
   }
   if ($pa==='delete') { $db->prepare("DELETE FROM cirugias WHERE id=?")->execute([(int)$_POST['id']]); $action='list'; }
 }
@@ -68,6 +83,13 @@ if (in_array($action,['editar']) && isset($_GET['id'])) {
 
 $mascotas_sel=$db->query("SELECT m.id,CONCAT(m.nombre,' (',c.nombre,')') as label FROM mascotas m JOIN clientes c ON c.id=m.cliente_id WHERE m.estado='activo' ORDER BY m.nombre")->fetchAll();
 $vets_sel=$db->query("SELECT id,nombre FROM usuarios WHERE rol IN ('veterinario','admin') AND activo=1")->fetchAll();
+
+// Etiquetas actuales para precargar el buscador al EDITAR
+$mas_label=''; $vet_label='';
+if ($editing) {
+  foreach($mascotas_sel as $m){ if((int)$m['id']===(int)$editing['mascota_id']){ $mas_label=$m['label']; break; } }
+  foreach($vets_sel as $v){ if((int)$v['id']===(int)$editing['veterinario_id']){ $vet_label=$v['nombre']; break; } }
+}
 
 $estado_f=$_GET['estado']??'';
 $where="1=1"; $params=[];
@@ -83,6 +105,8 @@ $ei=['perro'=>'🐕','gato'=>'🐈','conejo'=>'🐰','ave'=>'🐦','reptil'=>'�
 ?>
 <div class="page">
 <?php if($msg==='success'): ?><div class="alert alert-success"><span class="alert-icon">✅</span>Cirugía guardada correctamente.</div><?php endif; ?>
+<?php if($msg==='error_req'): ?><div class="alert alert-danger"><span class="alert-icon">⚠️</span>Faltan datos obligatorios: selecciona <strong>mascota</strong> y <strong>veterinario</strong>, e indica el tipo y la fecha.</div><?php endif; ?>
+<?php if($msg==='error_db'): ?><div class="alert alert-danger"><span class="alert-icon">⛔</span>No se pudo guardar la cirugía. Revisa los datos e inténtalo de nuevo.</div><?php endif; ?>
 
 <?php if(in_array($action,['nueva','editar'])): ?>
 <!-- ── FORMULARIO ── -->
@@ -111,13 +135,13 @@ $ei=['perro'=>'🐕','gato'=>'🐈','conejo'=>'🐰','ave'=>'🐦','reptil'=>'�
     <div id="tab-basico" class="tab-content active">
       <div class="form-row">
         <div class="form-group" style="position:relative"><label class="form-label required">Mascota / Paciente</label>
-          <input type="text" id="inp-mas-cir" class="form-input" placeholder="🐾 Buscar mascota..." autocomplete="off">
-          <input type="hidden" name="mascota_id" id="hid-mas-cir" value="" required>
+          <input type="text" id="inp-mas-cir" class="form-input" placeholder="🐾 Buscar mascota..." autocomplete="off" value="<?= clean($mas_label) ?>">
+          <input type="hidden" name="mascota_id" id="hid-mas-cir" value="<?= (int)($editing['mascota_id']??0)?:'' ?>" required>
           <div id="drop-mas-cir" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg2);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.12);z-index:300;max-height:220px;overflow-y:auto"></div>
         </div>
         <div class="form-group" style="position:relative"><label class="form-label required">Veterinario responsable</label>
-          <input type="text" id="inp-vet-cir" class="form-input" placeholder="👨‍⚕️ Buscar veterinario..." autocomplete="off">
-          <input type="hidden" name="veterinario_id" id="hid-vet-cir" value="" required>
+          <input type="text" id="inp-vet-cir" class="form-input" placeholder="👨‍⚕️ Buscar veterinario..." autocomplete="off" value="<?= clean($vet_label) ?>">
+          <input type="hidden" name="veterinario_id" id="hid-vet-cir" value="<?= (int)($editing['veterinario_id']??0)?:'' ?>" required>
           <div id="drop-vet-cir" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg2);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.12);z-index:300;max-height:200px;overflow-y:auto"></div>
         </div>
       </div>

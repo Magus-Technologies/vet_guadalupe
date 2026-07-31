@@ -72,6 +72,12 @@ $groomings->execute([$fecha_f]); $groomings=$groomings->fetchAll();
 
 $servicio_labels=['bano_basico'=>'Baño Básico','bano_completo'=>'Baño Completo','corte'=>'Corte','bano_corte'=>'Baño + Corte','spa'=>'Spa Premium','deslanado'=>'Deslanado/Antipulgas','outro'=>'Otro'];
 $servicio_icons=['bano_basico'=>'🚿','bano_completo'=>'🛁','corte'=>'✂️','bano_corte'=>'✨','spa'=>'💆','deslanado'=>'🌿','outro'=>'🐾'];
+
+// Servicios del catálogo (Servicios) con tipo Baño/Grooming — para jalar precio y nombre
+$serv_catalogo = [];
+try {
+    $serv_catalogo = $db->query("SELECT id,nombre,precio,tipo FROM servicios WHERE activo=1 AND LOWER(tipo) IN ('baño','bano','grooming') ORDER BY tipo,nombre")->fetchAll();
+} catch (Exception $e) {}
 $estado_badge=['programado'=>'b-info','en_proceso'=>'b-warning','completado'=>'b-success','cancelado'=>'b-danger'];
 $ei=['perro'=>'🐕','gato'=>'🐈','conejo'=>'🐰','ave'=>'🐦','reptil'=>'🦎','roedor'=>'🐭','otro'=>'🐾'];
 $estado_color=['programado'=>'var(--info)','en_proceso'=>'var(--warning)','completado'=>'var(--success)','cancelado'=>'var(--danger)'];
@@ -128,6 +134,17 @@ $estado_color=['programado'=>'var(--info)','en_proceso'=>'var(--warning)','compl
         <?php endforeach; ?>
       </div>
     </div>
+
+    <?php if (!empty($serv_catalogo)): ?>
+    <div class="form-group" style="position:relative">
+      <label class="form-label">Servicio del catálogo (opcional)</label>
+      <input class="form-input" id="serv-cat-inp" autocomplete="off" placeholder="🔍 Escribe el nombre del servicio (Baño / Grooming)..."
+             oninput="scFilter()" onfocus="scFilter()" onblur="scBlur()">
+      <div id="serv-cat-drop" style="display:none;position:absolute;z-index:60;left:0;right:0;top:100%;margin-top:2px;max-height:230px;overflow:auto;background:var(--bg2);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow-lg,0 10px 30px rgba(0,0,0,.12))"></div>
+      <div class="text-xs text-muted" style="margin-top:4px">Busca entre los servicios que agregaste en <strong>Servicios</strong> con tipo Baño o Grooming. Al elegir uno, se completa el precio.</div>
+    </div>
+    <script>var SERV_CAT = <?= json_encode(array_map(fn($s)=>['id'=>(int)$s['id'],'nombre'=>$s['nombre'],'precio'=>(float)$s['precio'],'tipo'=>$s['tipo']], $serv_catalogo), JSON_UNESCAPED_UNICODE) ?>;</script>
+    <?php endif; ?>
 
     <div class="form-group"><label class="form-label">Tipo de corte (si aplica)</label>
       <input class="form-input" name="tipo_corte" value="<?= clean($editing['tipo_corte']??'') ?>" placeholder="Ej: Corte teddy, corte higiénico, corte raza...">
@@ -399,12 +416,31 @@ if (!$groom_sel && !empty($all_groomings)) {
                ? BASE_URL.'/public/uploads/'.$groom_sel['foto_mascota'] : null;
       $tel_det = preg_replace('/[^0-9]/','',ltrim($groom_sel['telefono'],'+'));
       if(strlen($tel_det)<11) $tel_det='51'.$tel_det;
-      $wa_msg = "✨ *VetPro Grooming*\n\nHola {$groom_sel['dueno']} 👋\n\n".
-                "Tu mascota *{$groom_sel['mascota']}* tiene servicio de grooming:\n".
-                "📅 ".date('d/m/Y H:i',strtotime($groom_sel['fecha']))."\n".
-                "💇 ".$servicio_labels[$groom_sel['tipo_servicio']].
-                ($groom_sel['tipo_corte'] ? ' — '.clean($groom_sel['tipo_corte']) : '')."\n\n".
-                "VetPro 🐾";
+      // Mensaje de WhatsApp: usa la plantilla EDITABLE del módulo WhatsApp (Grooming/Baño)
+      $wa_clinica = 'VetPro'; $wa_tpl = '';
+      try {
+        $_cfg = $db->query("SELECT clave,valor FROM configuracion WHERE clave IN ('nombre_clinica','clinica_nombre','wa_tpl_grooming')")->fetchAll(PDO::FETCH_KEY_PAIR);
+        foreach (['nombre_clinica','clinica_nombre'] as $_k) {
+          if (!empty(trim($_cfg[$_k] ?? ''))) { $wa_clinica = trim($_cfg[$_k]); break; }
+        }
+        $wa_tpl = trim($_cfg['wa_tpl_grooming'] ?? '');
+      } catch (Exception $e) {}
+      if ($wa_tpl === '') {
+        $wa_tpl = "✂️ *Grooming — {clinica}*\n\nHola {nombre_cliente} 👋\n\n¡*{nombre_mascota}* ya está listo! 🛁✨\n\n🧼 *Servicio:* {servicio}\n📅 *Fecha:* {fecha}\n🕐 *Hora:* {hora}\n💰 *Total:* S/. {precio}\n\nPuedes pasar a recogerlo cuando gustes.\n\n{clinica} 🐾";
+      }
+      $_serv_txt = ($servicio_labels[$groom_sel['tipo_servicio']] ?? $groom_sel['tipo_servicio'])
+                 . (!empty($groom_sel['tipo_corte']) ? ' — '.$groom_sel['tipo_corte'] : '');
+      $wa_msg = strtr($wa_tpl, [
+        '{clinica}'        => $wa_clinica,
+        '{veterinaria}'    => $wa_clinica,
+        '{nombre_cliente}' => (string)$groom_sel['dueno'],
+        '{nombre_mascota}' => (string)$groom_sel['mascota'],
+        '{servicio}'       => $_serv_txt,
+        '{fecha}'          => date('d/m/Y', strtotime($groom_sel['fecha'])),
+        '{hora}'           => date('H:i', strtotime($groom_sel['fecha'])),
+        '{precio}'         => number_format((float)($groom_sel['precio'] ?? 0), 2),
+        '{veterinario}'    => (string)($groom_sel['groomer'] ?? ''),
+      ]);
       $estado_cfg_det = [
         'programado'  => ['bg'=>'#dbeafe','color'=>'#1e3a8a','icon'=>'📅'],
         'en_proceso'  => ['bg'=>'#fef3c7','color'=>'#78350f','icon'=>'✂️'],
@@ -599,6 +635,29 @@ function updateServUI(){
   const sel=document.querySelector('input[name="tipo_servicio"]:checked');
   if(sel){const d=document.querySelector('.serv-opt[data-val="'+sel.value+'"]');if(d){d.style.borderColor='var(--primary)';d.style.background='var(--primary-l)';d.style.transform='scale(1.04)';}}
 }
+function aplicarServCatalogo(){}
+var SERV_CAT = window.SERV_CAT || [];
+function scEsc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function scFilter(){
+  var inp=document.getElementById('serv-cat-inp'), drop=document.getElementById('serv-cat-drop');
+  if(!inp||!drop||typeof SERV_CAT==='undefined') return;
+  var q=(inp.value||'').trim().toLowerCase();
+  var res=SERV_CAT.filter(function(s){ return q==='' || (s.nombre||'').toLowerCase().indexOf(q)>=0 || (s.tipo||'').toLowerCase().indexOf(q)>=0; }).slice(0,25);
+  if(!res.length){ drop.innerHTML='<div style="padding:9px 11px;font-size:12px;color:var(--text3)">Sin resultados</div>'; drop.style.display='block'; return; }
+  drop.innerHTML=res.map(function(s){
+    return '<div onmousedown="scPick('+s.id+')" style="padding:8px 11px;cursor:pointer;border-bottom:1px solid var(--border);font-size:13px">'
+      +'<strong>'+scEsc(s.nombre)+'</strong> — S/ '+(Number(s.precio)||0).toFixed(2)+' <span style="color:var(--text3)">('+scEsc(s.tipo)+')</span></div>';
+  }).join('');
+  drop.style.display='block';
+}
+function scPick(id){
+  var s=SERV_CAT.filter(function(x){return x.id===id;})[0]; if(!s) return;
+  var inp=document.getElementById('serv-cat-inp'); if(inp) inp.value=s.nombre;
+  var p=document.querySelector('[name="precio"]'); if(p) p.value=(Number(s.precio)||0).toFixed(2);
+  var tc=document.querySelector('[name="tipo_corte"]'); if(tc && !tc.value) tc.value=s.nombre;
+  var drop=document.getElementById('serv-cat-drop'); if(drop) drop.style.display='none';
+}
+function scBlur(){ setTimeout(function(){ var d=document.getElementById('serv-cat-drop'); if(d) d.style.display='none'; },150); }
 document.addEventListener('DOMContentLoaded',()=>{
   updateServUI();
   // Auto scroll al item seleccionado

@@ -3,56 +3,60 @@
    Paleta moderna, componentes premium, iconos actualizados
    ═══════════════════════════════════════════════════════════ */
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Syne:wght@600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Inter:wght@300;400;500;600;700;800&display=swap');
 
 *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
 
 :root {
+  /* ── CLÍNICA SERENA · paleta teal/esmeralda ── */
   /* Colores principales */
-  --primary:#1ea8a1;
-  --primary-l:#e8f8f7;
-  --primary-d:#158a83;
-  --primary-glow:rgba(30,168,161,.15);
-  --accent:#6366f1;
-  --accent-l:#eef2ff;
-  --accent-d:#4f46e5;
+  --primary:#0e9c8b;
+  --primary-l:#e4f4f1;
+  --primary-d:#0a7e70;
+  --primary-glow:rgba(14,156,139,.15);
+  --accent:#13b9a6;
+  --accent-l:#e2f6f3;
+  --accent-d:#0c8b7c;
   /* Semánticos */
-  --success:#10b981;--success-l:#d1fae5;--success-d:#059669;
-  --danger:#ef4444;--danger-l:#fee2e2;--danger-d:#dc2626;
-  --warning:#f59e0b;--warning-l:#fef3c7;--warning-d:#d97706;
-  --info:#3b82f6;--info-l:#dbeafe;--info-d:#2563eb;
-  --purple:#8b5cf6;--purple-l:#ede9fe;--purple-d:#7c3aed;
-  --pink:#ec4899;--pink-l:#fce7f3;--pink-d:#db2777;
+  --success:#3fa66b;--success-l:#e4f3ea;--success-d:#2f8a55;
+  --danger:#e15b5b;--danger-l:#fce9e9;--danger-d:#c94a4a;
+  --warning:#d6912e;--warning-l:#fbf0dc;--warning-d:#b97a22;
+  --info:#3f76c4;--info-l:#e8f0fb;--info-d:#2f61a8;
+  --purple:#7c66d6;--purple-l:#eeeafb;--purple-d:#6a55c0;
+  --pink:#d36598;--pink-l:#fbe9f1;--pink-d:#bd5184;
   --wa:#25d366;--wa-l:#dcfce7;--wa-d:#16a34a;
-  --orange:#f97316;--orange-l:#ffedd5;--orange-d:#ea580c;
+  --orange:#e08a3c;--orange-l:#fbeedd;--orange-d:#c4722a;
+  /* Alias de color usados en módulos (antes no estaban definidos) */
+  --red:#e15b5b;--green:#3fa66b;--amber:#d6912e;
+  --teal:#0e9c8b;--blue:#3f76c4;--yellow:#e0a93b;
   /* Superficie */
-  --bg:#f4f6fa;
+  --bg:#f4f7f8;
   --bg2:#ffffff;
-  --bg3:#f8fafc;
-  --bg4:#f1f5f9;
+  --bg3:#f7fafa;
+  --bg4:#eef3f4;
   /* Bordes */
-  --border:#e8ecf1;
-  --border2:#d4dae4;
+  --border:#e6eced;
+  --border2:#d6e0e1;
   /* Texto */
-  --text:#0f172a;
-  --text2:#475569;
-  --text3:#94a3b8;
-  --text4:#cbd5e1;
+  --text:#102a2e;
+  --text2:#33484c;
+  --text3:#6e8589;
+  --text4:#a9bbbd;
   /* Sidebar */
-  --sidebar:#0f1729;
-  --sidebar2:#162137;
+  --sidebar:#0c2227;
+  --sidebar2:#0b1d21;
   --sidebar-w:256px;
-  /* Sombras */
-  --shadow-xs:0 1px 2px rgba(0,0,0,.04);
-  --shadow-sm:0 2px 8px rgba(0,0,0,.06);
-  --shadow:0 4px 16px rgba(0,0,0,.08);
-  --shadow-lg:0 10px 40px rgba(0,0,0,.12);
-  --shadow-xl:0 20px 60px rgba(0,0,0,.16);
+  /* Sombras (suaves, look "clínica") */
+  --shadow-xs:0 1px 2px rgba(16,42,46,.04);
+  --shadow-sm:0 2px 8px rgba(16,42,46,.05);
+  --shadow:0 4px 16px rgba(16,42,46,.06);
+  --shadow-lg:0 10px 36px rgba(16,42,46,.10);
+  --shadow-xl:0 20px 56px rgba(16,42,46,.14);
   /* Radios */
-  --r-xs:6px;--r-sm:8px;--r:12px;--r-lg:16px;--r-xl:20px;--r-full:999px;
+  --r-xs:6px;--r-sm:8px;--r:14px;--r-lg:16px;--r-xl:20px;--r-full:999px;
   /* Tipografía */
   --font:'Inter',system-ui,-apple-system,sans-serif;
-  --font-display:'Syne','Inter',sans-serif;
+  --font-display:'Plus Jakarta Sans','Inter',sans-serif;
   /* Transiciones */
   --ease:.18s ease;
 }

@@ -28,7 +28,7 @@ function fm_leer_excel_xml($raw) {
             if ($data !== null && count($data)) $val = (string)$data;
             $celdas[$colIdx] = $val; $colIdx++;
         }
-        if ($celdas) { ksort($celdas); $filas[] = array_values($celdas); }
+        if ($celdas) { ksort($celdas); $_max=max(array_keys($celdas)); $_fila=[]; for($_j=0;$_j<=$_max;$_j++) $_fila[$_j]=$celdas[$_j]??""; $filas[] = $_fila; }
     }
     return $filas;
 }
@@ -76,7 +76,7 @@ function fm_leer_xlsx($path) {
             elseif ($tipo === 'inlineStr' && isset($c->is->t)) { $v = (string)$c->is->t; }
             $celdas[$colIdx] = $v; $colIdx++;
         }
-        if ($celdas) { ksort($celdas); $filas[] = array_values($celdas); }
+        if ($celdas) { ksort($celdas); $_max=max(array_keys($celdas)); $_fila=[]; for($_j=0;$_j<=$_max;$_j++) $_fila[$_j]=$celdas[$_j]??""; $filas[] = $_fila; }
     }
     return $filas;
 }
@@ -149,7 +149,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // ── IMPORTAR productos de farmacia masivamente ──
     if ($pa === 'importar_farmacia') {
-        $importados = 0; $omitidos = 0; $err_imp = '';
+        $importados = 0; $omitidos = 0; $err_imp = ''; $errores_imp = []; $actualizados = 0;
         try {
             if (empty($_FILES['archivo']['tmp_name'])) throw new Exception('No se recibió ningún archivo.');
             $tmp = $_FILES['archivo']['tmp_name'];
@@ -157,6 +157,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $filas = [];
             if (substr($raw,0,2) === 'PK') {
                 $filas = fm_leer_xlsx($tmp);
+            } elseif (substr($raw,0,4) === "\xD0\xCF\x11\xE0") {
+                throw new Exception('El archivo es un Excel binario antiguo (.xls 97-2003), que no es compatible. Ábrelo en Excel y usa «Guardar como» → «Libro de Excel (.xlsx)» o «CSV (delimitado por comas)», o usa la plantilla que descargas del sistema. Luego vuelve a importarlo.');
             } elseif (stripos($raw,'<?xml') !== false || stripos($raw,'spreadsheet') !== false) {
                 $filas = fm_leer_excel_xml($raw);
             } else {
@@ -193,6 +195,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  (categoria_id,nombre,descripcion,presentacion,laboratorio,codigo_barras,precio_costo,precio_venta,stock,stock_minimo,lote,fecha_vencimiento,sede_id)
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
+            // UPSERT: si el producto ya existe (por código de barras o nombre) se ACTUALIZA en vez de duplicar.
+            $upd = $db->prepare(
+                "UPDATE productos SET categoria_id=?, nombre=?, descripcion=?, presentacion=?, laboratorio=?,
+                    codigo_barras = COALESCE(NULLIF(?,''), codigo_barras),
+                    precio_costo=?, precio_venta=?, stock=?, stock_minimo=?, lote=?, fecha_vencimiento=?
+                 WHERE id=?"
+            );
+            $find_cb  = $db->prepare("SELECT id FROM productos WHERE codigo_barras=? AND codigo_barras<>'' AND sede_id=? LIMIT 1");
+            $find_nom = $db->prepare("SELECT id FROM productos WHERE nombre=? AND sede_id=? LIMIT 1");
+
+            // Parseo robusto de precios: soporta "1,500.00", "1.500,00", "S/ 1500", "1500", etc.
+            $fm_num = function($s) {
+                $s = trim((string)$s);
+                $s = preg_replace('/[^\d.,\-]/', '', $s); // quita S/, espacios, letras
+                if ($s === '' || $s === '-') return 0.0;
+                $lc = strrpos($s, ','); $ld = strrpos($s, '.');
+                if ($lc !== false && $ld !== false) {
+                    if ($lc > $ld) { $s = str_replace('.', '', $s); $s = str_replace(',', '.', $s); } // 1.500,00
+                    else           { $s = str_replace(',', '', $s); }                                  // 1,500.00
+                } elseif ($lc !== false) {
+                    if (preg_match('/,\d{1,2}$/', $s)) $s = str_replace(',', '.', $s); // 1,50 -> 1.50 (decimal)
+                    else                               $s = str_replace(',', '', $s);  // 1,500 -> 1500 (miles)
+                }
+                return (float)$s;
+            };
+            $errores_imp = [];       // detalle de filas saltadas
+            $MAX_DECIMAL = 99999999.99; // tope de DECIMAL(10,2)
 
             foreach ($filas as $f) {
                 $f = array_map(fn($v)=>trim((string)$v), $f);
@@ -209,8 +238,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $present     = $f[3] ?? '';
                 $laboratorio = $f[4] ?? '';
                 $cod_barras  = $f[5] ?? '';
-                $p_costo     = (float)str_replace([',','S/','s/',' '],['.','','',''], $f[6] ?? '0');
-                $p_venta     = (float)str_replace([',','S/','s/',' '],['.','','',''], $f[7] ?? '0');
+                $p_costo     = $fm_num($f[6] ?? '0');
+                $p_venta     = $fm_num($f[7] ?? '0');
                 $stock       = (int)($f[8] ?? 0);
                 $stock_min   = (int)($f[9] ?? 5);
                 $lote        = $f[10] ?? '';
@@ -225,14 +254,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 }
 
-                $ins->execute([$cat_id,$nombre,$descripcion,$present,$laboratorio,$cod_barras,$p_costo,$p_venta,$stock,$stock_min,$lote ?: null,$fecha_venc,$sede_destino]);
-                $importados++;
+                // Validar rango de precios (DECIMAL(10,2)). Evita el error 1264.
+                if ($p_costo < 0) $p_costo = 0;
+                if ($p_venta < 0) $p_venta = 0;
+                if ($p_costo > $MAX_DECIMAL || $p_venta > $MAX_DECIMAL) {
+                    $omitidos++;
+                    $errores_imp[] = "«{$nombre}»: precio fuera de rango (costo ".number_format($p_costo,2).", venta ".number_format($p_venta,2)."). Revisa que las columnas del archivo estén en orden y que no haya un código de barras en la columna de precio.";
+                    continue;
+                }
+
+                try {
+                    // ¿ya existe? -> por código de barras; si no tiene, por nombre (misma sede)
+                    $pid = 0;
+                    if ($cod_barras !== '') { $find_cb->execute([$cod_barras, $sede_destino]); $pid = (int)($find_cb->fetchColumn() ?: 0); }
+                    if (!$pid)              { $find_nom->execute([$nombre, $sede_destino]);     $pid = (int)($find_nom->fetchColumn() ?: 0); }
+
+                    if ($pid) {
+                        $upd->execute([$cat_id,$nombre,$descripcion,$present,$laboratorio,$cod_barras,$p_costo,$p_venta,$stock,$stock_min,$lote ?: null,$fecha_venc,$pid]);
+                        $actualizados++;
+                    } else {
+                        $ins->execute([$cat_id,$nombre,$descripcion,$present,$laboratorio,$cod_barras,$p_costo,$p_venta,$stock,$stock_min,$lote ?: null,$fecha_venc,$sede_destino]);
+                        $importados++;
+                    }
+                } catch (Exception $eRow) {
+                    $omitidos++;
+                    $errores_imp[] = "«{$nombre}»: ".$eRow->getMessage();
+                }
             }
         } catch(Exception $e) {
             $err_imp = $e->getMessage();
         }
-        $qs = 'p=farmacia&imp='.$importados.'&om='.$omitidos;
+        $qs = 'p=farmacia&imp='.$importados.'&act='.$actualizados.'&om='.$omitidos;
         if ($err_imp) $qs .= '&imperr='.urlencode(substr($err_imp,0,200));
+        if (!empty($errores_imp)) $qs .= '&impdet='.urlencode(substr(implode(' • ', array_slice($errores_imp,0,4)),0,500));
         if (!headers_sent()) { header('Location: '.BASE_URL.'/index.php?'.$qs); exit; }
         echo '<script>location.href='.json_encode(BASE_URL.'/index.php?'.$qs).';</script>'; exit;
     }
@@ -456,8 +510,9 @@ document.addEventListener('DOMContentLoaded', function(){
 <?php if (isset($_GET['imp'])): ?>
 <div class="card mb-2" style="padding:13px 16px;background:#f0fdf4;border-left:3px solid #10b981">
   <div style="font-size:13px;color:#065f46">
-    ✅ Importación completada: <strong><?= (int)$_GET['imp'] ?></strong> producto(s) agregado(s)<?= (int)($_GET['om']??0) ? ', '.(int)$_GET['om'].' omitido(s) (sin nombre)' : '' ?>.
+    ✅ Importación completada: <strong><?= (int)$_GET['imp'] ?></strong> agregado(s)<?= (int)($_GET['act']??0) ? ', <strong>'.(int)$_GET['act'].'</strong> actualizado(s)' : '' ?><?= (int)($_GET['om']??0) ? ', '.(int)$_GET['om'].' omitido(s)' : '' ?>.
     <?php if(!empty($_GET['imperr'])): ?><br><span style="color:#b91c1c">⚠️ <?= clean($_GET['imperr']) ?></span><?php endif; ?>
+    <?php if(!empty($_GET['impdet'])): ?><br><span style="color:#b45309;font-size:12px">Filas no importadas → <?= clean($_GET['impdet']) ?></span><?php endif; ?>
   </div>
 </div>
 <?php endif; ?>

@@ -1,6 +1,7 @@
 <?php
 $page = 'vacunas'; $pageTitle = 'Vacunación';
-require_once __DIR__ . '/../includes/header.php';
+require_once __DIR__ . '/../includes/config.php';
+requireLogin();
 $db = getDB();
 $action = $_GET['action'] ?? 'list';
 $msg = '';
@@ -55,6 +56,30 @@ if ($action === 'tv_reactivar' && isset($_GET['id'])) {
 $tipos_activos = $db->query("SELECT id,nombre FROM tipos_vacuna WHERE estado='activo' ORDER BY nombre")->fetchAll();
 $tipos_todos   = $db->query("SELECT id,nombre,estado FROM tipos_vacuna ORDER BY estado, nombre")->fetchAll();
 
+// ─────────────────────────────────────────────────────────────
+// Estado guardado por vacuna (idempotente)
+//   aplicada   → registro normal; su situación (vigente/por vencer/
+//                vencida) se sigue calculando por fecha
+//   completada → ciclo cerrado; no pide recordatorio ni cuenta como vencida
+//   anulada    → registro erróneo/anulado; excluido de alertas
+// ─────────────────────────────────────────────────────────────
+try {
+    $vc = $db->query("SHOW COLUMNS FROM vacunas LIKE 'estado'")->fetchAll();
+    if (empty($vc)) {
+        $db->exec("ALTER TABLE vacunas ADD COLUMN estado ENUM('aplicada','completada','anulada') NOT NULL DEFAULT 'aplicada'");
+    }
+} catch (Exception $e) {}
+
+// Cambiar el estado de una vacuna (vía GET, conserva los filtros activos)
+if ($action === 'set_estado' && isset($_GET['id'])) {
+    $nv = $_GET['val'] ?? '';
+    if (in_array($nv, ['aplicada','completada','anulada'], true)) {
+        $db->prepare("UPDATE vacunas SET estado=? WHERE id=?")->execute([$nv, (int)$_GET['id']]);
+    }
+    $keep = array_intersect_key($_GET, array_flip(['q','estado','mascota_id']));
+    header('Location: ?p=vacunas' . ($keep ? '&'.http_build_query($keep) : '')); exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action']??'') === 'save') {
     $fields = ['mascota_id','veterinario_id','tipo_vacuna','laboratorio','lote','fecha_aplicacion','fecha_vencimiento','proxima_dosis','notas'];
     $data=[]; foreach($fields as $f) $data[$f] = trim($_POST[$f]??'') ?: null;
@@ -75,9 +100,11 @@ if ($mascota_id) { $where .= " AND v.mascota_id=?"; $params[]=$mascota_id; }
 $search = trim($_GET['q']??'');
 if ($search) { $where .= " AND (m.nombre LIKE ? OR cl.nombre LIKE ? OR v.tipo_vacuna LIKE ?)"; $like="%$search%"; $params=array_merge($params,[$like,$like,$like]); }
 $estado_f = $_GET['estado']??'';
-if ($estado_f==='vigente')    $where .= " AND v.proxima_dosis > DATE_ADD(CURDATE(),INTERVAL 7 DAY)";
-elseif($estado_f==='por_vencer') $where .= " AND v.proxima_dosis BETWEEN CURDATE() AND DATE_ADD(CURDATE(),INTERVAL 7 DAY)";
-elseif($estado_f==='vencida')    $where .= " AND v.proxima_dosis < CURDATE()";
+if ($estado_f==='vigente')    $where .= " AND v.estado='aplicada' AND v.proxima_dosis > DATE_ADD(CURDATE(),INTERVAL 7 DAY)";
+elseif($estado_f==='por_vencer') $where .= " AND v.estado='aplicada' AND v.proxima_dosis BETWEEN CURDATE() AND DATE_ADD(CURDATE(),INTERVAL 7 DAY)";
+elseif($estado_f==='vencida')    $where .= " AND v.estado='aplicada' AND v.proxima_dosis < CURDATE()";
+elseif($estado_f==='completada') $where .= " AND v.estado='completada'";
+elseif($estado_f==='anulada')    $where .= " AND v.estado='anulada'";
 try {
     $_r=$db->query("SHOW COLUMNS FROM `mascotas` LIKE 'sede_id'")->fetchAll();
     if(!empty($_r)) {
@@ -90,12 +117,15 @@ $st->execute($params); $vacunas = $st->fetchAll();
 
 // Contadores
 $st_stats = $db->query("SELECT
-  SUM(proxima_dosis > DATE_ADD(CURDATE(),INTERVAL 7 DAY)) as vigente,
-  SUM(proxima_dosis BETWEEN CURDATE() AND DATE_ADD(CURDATE(),INTERVAL 7 DAY)) as por_vencer,
-  SUM(proxima_dosis < CURDATE()) as vencida FROM vacunas");
+  SUM(estado='aplicada' AND proxima_dosis > DATE_ADD(CURDATE(),INTERVAL 7 DAY)) as vigente,
+  SUM(estado='aplicada' AND proxima_dosis BETWEEN CURDATE() AND DATE_ADD(CURDATE(),INTERVAL 7 DAY)) as por_vencer,
+  SUM(estado='aplicada' AND proxima_dosis < CURDATE()) as vencida FROM vacunas");
 $stats = $st_stats->fetch();
 
 $especie_icons=['perro'=>'🐕','gato'=>'🐈','conejo'=>'🐰','ave'=>'🐦','reptil'=>'🦎','roedor'=>'🐭','otro'=>'🐾'];
+
+// Recién aquí imprimimos la página (todas las acciones que redirigen ya corrieron arriba)
+require_once __DIR__ . '/../includes/header.php';
 ?>
 <?php if($msg==='success'): ?><div class="alert alert-success mb-2">✅ Vacuna registrada correctamente.</div><?php endif; ?>
 
@@ -221,6 +251,8 @@ $especie_icons=['perro'=>'🐕','gato'=>'🐈','conejo'=>'🐰','ave'=>'🐦','r
         <option value="vigente" <?= $estado_f==='vigente'?'selected':'' ?>>Vigentes</option>
         <option value="por_vencer" <?= $estado_f==='por_vencer'?'selected':'' ?>>Por vencer</option>
         <option value="vencida" <?= $estado_f==='vencida'?'selected':'' ?>>Vencidas</option>
+        <option value="completada" <?= $estado_f==='completada'?'selected':'' ?>>Completadas</option>
+        <option value="anulada" <?= $estado_f==='anulada'?'selected':'' ?>>Anuladas</option>
       </select>
       <button type="submit" class="btn">Filtrar</button>
     </form>
@@ -233,25 +265,45 @@ $especie_icons=['perro'=>'🐕','gato'=>'🐈','conejo'=>'🐰','ave'=>'🐦','r
     <table class="vtable">
       <thead><tr><th>Mascota</th><th>Dueño</th><th>Vacuna</th><th>Laboratorio / Lote</th><th>Aplicada</th><th>Próxima dosis</th><th>Estado</th><th>Acciones</th></tr></thead>
       <tbody>
-        <?php foreach($vacunas as $v):
-          $proxima_ts = strtotime($v['proxima_dosis']);
-          $dias = ($proxima_ts - time()) / 86400;
-          $estado = $dias < 0 ? 'Vencida' : ($dias <= 7 ? 'Por vencer' : 'Vigente');
-          $badge = $estado==='Vencida' ? 'b-red' : ($estado==='Por vencer' ? 'b-amber' : 'b-teal');
+        <?php
+          $qs_keep = array_intersect_key($_GET, array_flip(['q','estado','mascota_id']));
+          $qs = $qs_keep ? '&'.http_build_query($qs_keep) : '';
+          foreach($vacunas as $v):
+          $tiene_prox = !empty($v['proxima_dosis']);
+          $proxima_ts = $tiene_prox ? strtotime($v['proxima_dosis']) : null;
+          $dias = $tiene_prox ? ($proxima_ts - time()) / 86400 : null;
+          if ($v['estado']==='anulada') {
+              $estado='Anulada'; $bstyle='background:#f1f5f9;color:#64748b';
+          } elseif ($v['estado']==='completada') {
+              $estado='Completada'; $bstyle='background:#dcfce7;color:#15803d';
+          } elseif (!$tiene_prox) {
+              $estado='Sin próxima'; $bstyle='background:#f1f5f9;color:#64748b';
+          } else {
+              $estado = $dias < 0 ? 'Vencida' : ($dias <= 7 ? 'Por vencer' : 'Vigente');
+              $bstyle = $dias < 0 ? 'background:#fee2e2;color:#b91c1c' : ($dias <= 7 ? 'background:#fef3c7;color:#b45309' : 'background:#ccfbf1;color:#0f766e');
+          }
+          $es_aplicada = ($v['estado']==='aplicada');
           $tel = preg_replace('/[^0-9]/','',ltrim($v['telefono'],'+'));
           if(strlen($tel)<11) $tel='51'.$tel;
-          $wa_msg="💉 *Alerta de Vacuna — VetPro*\n\nHola {$v['dueno']} 👋\n\nLa vacuna de *{$v['mascota']}* ".($dias<0?'ha vencido':'vence pronto').":\n🗓️ *Vencimiento:* ".date('d/m/Y',$proxima_ts)."\n💉 {$v['tipo_vacuna']}\n\n👉 Agenda su cita respondiendo este mensaje.\n\nVetPro 🐾";
+          $wa_msg = $tiene_prox ? "💉 *Alerta de Vacuna — VetPro*\n\nHola {$v['dueno']} 👋\n\nLa vacuna de *{$v['mascota']}* ".($dias<0?'ha vencido':'vence pronto').":\n🗓️ *Vencimiento:* ".date('d/m/Y',$proxima_ts)."\n💉 {$v['tipo_vacuna']}\n\n👉 Agenda su cita respondiendo este mensaje.\n\nVetPro 🐾" : '';
         ?>
-        <tr>
+        <tr<?= $v['estado']==='anulada'?' style="opacity:.6"':'' ?>>
           <td><div class="flex items-center gap-1"><span style="font-size:18px"><?= $especie_icons[$v['especie']]??'🐾' ?></span><span class="td-main"><?= clean($v['mascota']) ?></span></div></td>
           <td><?= clean($v['dueno']) ?></td>
           <td class="font-med"><?= clean($v['tipo_vacuna']) ?></td>
           <td class="text-muted text-xs"><?= clean($v['laboratorio']??'—') ?><br><?= clean($v['lote']??'—') ?></td>
           <td class="text-muted"><?= date('d/m/Y',strtotime($v['fecha_aplicacion'])) ?></td>
-          <td class="<?= $estado==='Vencida'?'font-bold':'font-med' ?>" style="color:<?= $estado==='Vencida'?'var(--red)':($estado==='Por vencer'?'var(--amber)':'var(--text)') ?>"><?= date('d/m/Y',$proxima_ts) ?></td>
-          <td><span class="badge <?= $badge ?>"><span class="dot"></span> <?= $estado ?></span></td>
+          <td class="<?= ($es_aplicada && $tiene_prox && $dias<0)?'font-bold':'font-med' ?>" style="color:<?= ($es_aplicada && $tiene_prox && $dias<0)?'var(--red)':(($es_aplicada && $tiene_prox && $dias<=7)?'var(--amber)':'var(--text)') ?>"><?= $tiene_prox ? date('d/m/Y',$proxima_ts) : '—' ?></td>
+          <td>
+            <span class="badge" style="<?= $bstyle ?>"><span class="dot"></span> <?= $estado ?></span>
+            <select onchange="if(this.value!=='<?= $v['estado'] ?>')location.href='?p=vacunas&action=set_estado&id=<?= $v['id'] ?>&val='+this.value+'<?= htmlspecialchars($qs, ENT_QUOTES) ?>'" class="form-input" style="margin-top:5px;padding:2px 6px;font-size:11px;height:auto;width:auto" title="Cambiar estado">
+              <option value="aplicada"   <?= $v['estado']==='aplicada'?'selected':'' ?>>Aplicada</option>
+              <option value="completada" <?= $v['estado']==='completada'?'selected':'' ?>>Completada</option>
+              <option value="anulada"    <?= $v['estado']==='anulada'?'selected':'' ?>>Anulada</option>
+            </select>
+          </td>
           <td><div class="flex gap-1">
-            <a href="https://wa.me/<?= $tel ?>?text=<?= rawurlencode($wa_msg) ?>" target="_blank" class="btn btn-xs btn-wa" title="Recordatorio WA">💬</a>
+            <?php if($es_aplicada && $tiene_prox): ?><a href="https://wa.me/<?= $tel ?>?text=<?= rawurlencode($wa_msg) ?>" target="_blank" class="btn btn-xs btn-wa" title="Recordatorio WA">💬</a><?php endif; ?>
             <a href="?p=vacunas&action=delete&id=<?= $v['id'] ?>" class="btn btn-xs" style="color:var(--red)" onclick="return confirm('¿Eliminar este registro?')">✕</a>
           </div></td>
         </tr>

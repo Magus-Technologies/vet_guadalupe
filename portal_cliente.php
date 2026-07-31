@@ -24,6 +24,27 @@ $mascota_act = null;
 foreach($mascotas as $m) if($m['id']===$mascota_sel) { $mascota_act=$m; break; }
 if(!$mascota_act && !empty($mascotas)) { $mascota_act=$mascotas[0]; $mascota_sel=$mascota_act['id']; }
 
+// ── Satisfacción: tabla + guardar evaluación (antes de imprimir HTML) ──
+try {
+    $db->exec("CREATE TABLE IF NOT EXISTS satisfaccion (
+        id INT AUTO_INCREMENT PRIMARY KEY, cliente_id INT NULL, cita_id INT NULL, mascota_id INT NULL,
+        puntuacion TINYINT NOT NULL, comentario TEXT NULL, origen VARCHAR(20) DEFAULT 'portal',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, KEY idx_cli (cliente_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+} catch (Exception $e) {}
+
+if ($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['accion'] ?? '')==='satisfaccion') {
+    $punt = (int)($_POST['puntuacion'] ?? 0);
+    $com  = trim($_POST['comentario'] ?? '');
+    if ($punt>=1 && $punt<=5) {
+        try {
+            $db->prepare("INSERT INTO satisfaccion (cliente_id,mascota_id,puntuacion,comentario,origen) VALUES (?,?,?,?, 'portal')")
+               ->execute([$cliente_id, ($mascota_sel?:null), $punt, ($com?:null)]);
+        } catch (Exception $e) {}
+    }
+    header('Location: portal_cliente.php?t='.urlencode($token).'&m='.$mascota_sel.'&grx=1'); exit;
+}
+
 $consultas = $vacunas = $citas_prox = [];
 if ($mascota_act) {
     $st=$db->prepare("SELECT con.*,u.nombre as veterinario FROM consultas con JOIN usuarios u ON u.id=con.veterinario_id WHERE con.mascota_id=? ORDER BY con.fecha DESC LIMIT 10"); $st->execute([$mascota_sel]); $consultas=$st->fetchAll();
@@ -42,7 +63,7 @@ $ei=['perro'=>'🐕','gato'=>'🐈','conejo'=>'🐰','ave'=>'🐦','reptil'=>'�
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--teal:#0d9f7a;--teal-l:#e0f5ee;--teal-d:#0a7a5e;--text:#1a1d23;--text2:#5a6072;--text3:#9299a8;--border:#e2e5eb;--bg:#f0f2f5;--bg2:#fff;--red:#dc2626;--red-l:#fef2f2;--amber:#d97706;--amber-l:#fffbeb;--blue:#2563eb;--green:#16a34a;--green-l:#f0fdf4;--wa:#25D366;--wa-d:#128C7E}
 body{font-family:'Plus Jakarta Sans',sans-serif;background:var(--bg);color:var(--text);font-size:14px}
-.topbar{background:#111827;padding:14px 20px;display:flex;align-items:center;gap:10px}
+.topbar{background:#111827;padding:14px 20px;display:flex;align-items:center;justify-content:center;gap:10px}
 .logo{width:36px;height:36px;background:var(--teal);border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:18px}
 .logo-t{font-size:17px;font-weight:800;color:#fff}
 .logo-sub{font-size:11px;color:rgba(255,255,255,.4)}
@@ -73,7 +94,14 @@ tr:last-child td{border-bottom:none}
 </head>
 <body>
 <div class="topbar">
-  <div class="logo">🐾</div>
+  <?php $logo_pt = trim($cfg['logo_path'] ?? ''); ?>
+  <div class="logo">
+    <?php if ($logo_pt !== ''): ?>
+      <img src="<?= UPLOADS_URL . '/' . htmlspecialchars($logo_pt) ?>" alt="<?= clean($cfg['nombre_clinica']??'VetPro') ?>"
+           style="width:100%;height:100%;object-fit:contain;background:#fff;border-radius:inherit;padding:2px"
+           onerror="this.style.display='none';this.parentNode.textContent='🐾'">
+    <?php else: ?>🐾<?php endif; ?>
+  </div>
   <div><div class="logo-t"><?= clean($cfg['nombre_clinica']??'VetPro') ?></div><div class="logo-sub">Portal del cliente</div></div>
 </div>
 
@@ -176,6 +204,27 @@ tr:last-child td{border-bottom:none}
   <div class="card" style="text-align:center;color:var(--text3);padding:48px">No tienes mascotas registradas.</div>
   <?php endif; ?>
 
+  <!-- RESERVAR + SATISFACCIÓN -->
+  <a href="reservar.php" class="wa-btn" style="background:var(--teal);margin-top:16px;text-decoration:none">📅 Reservar una nueva cita</a>
+
+  <div class="card" style="margin-top:14px">
+    <div style="font-weight:700;margin-bottom:4px">⭐ ¿Cómo fue tu experiencia?</div>
+    <div style="font-size:12.5px;color:var(--text3);margin-bottom:12px">Tu opinión nos ayuda a mejorar la atención.</div>
+    <?php if(!empty($_GET['grx'])): ?>
+      <div class="alert" style="background:var(--green-l);color:var(--green)"><span>✅</span><span>¡Gracias por tu evaluación! 🐾</span></div>
+    <?php else: ?>
+    <form method="post">
+      <input type="hidden" name="accion" value="satisfaccion">
+      <input type="hidden" name="puntuacion" id="punt" value="0">
+      <div id="stars" style="display:flex;gap:8px;font-size:36px;margin-bottom:12px">
+        <?php for($i=1;$i<=5;$i++): ?><span class="star" data-v="<?= $i ?>" onclick="setStar(<?= $i ?>)" style="color:#d1d5db;cursor:pointer;transition:color .1s;line-height:1">★</span><?php endfor; ?>
+      </div>
+      <textarea name="comentario" rows="3" maxlength="500" placeholder="Cuéntanos tu experiencia (opcional)" style="width:100%;font-family:inherit;font-size:14px;padding:11px 13px;border:1px solid var(--border);border-radius:10px;resize:vertical;color:var(--text)"></textarea>
+      <button class="wa-btn" style="background:var(--teal);margin-top:10px;border:0;cursor:pointer;width:100%" type="submit" onclick="return (document.getElementById('punt').value>0) || (alert('Por favor selecciona una puntuación (1 a 5 estrellas).'),false)">Enviar evaluación</button>
+    </form>
+    <?php endif; ?>
+  </div>
+
   <!-- FOOTER CONTACTO -->
   <div class="card" style="background:#f8f9fb;margin-top:16px">
     <div style="font-weight:700;margin-bottom:8px">📍 <?= clean($cfg['nombre_clinica']??'VetPro') ?></div>
@@ -194,6 +243,10 @@ function showTab(t) {
     document.getElementById('sec-'+s).style.display=s===t?'block':'none';
     var b=document.getElementById('tb-'+s);if(b)b.classList.toggle('active',s===t);
   });
+}
+function setStar(v){
+  document.getElementById('punt').value=v;
+  document.querySelectorAll('#stars .star').forEach(function(s){ s.style.color = (parseInt(s.dataset.v,10)<=v)?'#f59e0b':'#d1d5db'; });
 }
 </script>
 </body>

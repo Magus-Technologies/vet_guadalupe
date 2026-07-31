@@ -23,6 +23,12 @@ class SunatClient
         return $this->post('/generar/comprobante', $payload);
     }
 
+    /** Genera el XML firmado de una nota de crédito/débito. */
+    public function generarNota(array $payload): array
+    {
+        return $this->post('/generar/nota', $payload);
+    }
+
     /** Envía el XML firmado a SUNAT y devuelve el CDR. */
     public function enviarDocumento(array $payload): array
     {

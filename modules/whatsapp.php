@@ -70,6 +70,9 @@ $db = getDB();
 $clientes = $db->query("SELECT id,nombre,telefono FROM clientes WHERE activo=1 ORDER BY nombre")->fetchAll();
 $mascotas = $db->query("SELECT m.id,m.nombre,m.especie,c.nombre as dueno,c.id as cliente_id FROM mascotas m JOIN clientes c ON c.id=m.cliente_id WHERE m.estado='activo' ORDER BY m.nombre")->fetchAll();
 $veterinarios = $db->query("SELECT id,nombre FROM usuarios WHERE rol IN ('veterinario','admin') AND activo=1")->fetchAll();
+// Servicios de Baño/Grooming del catálogo (para la plantilla de grooming)
+$serv_groom = [];
+try { $serv_groom = $db->query("SELECT nombre,precio FROM servicios WHERE activo=1 AND LOWER(tipo) IN ('baño','bano','grooming') ORDER BY nombre")->fetchAll(); } catch (Exception $e) {}
 
 // Historial
 $log = $db->query("SELECT l.*,c.nombre as cliente,m.nombre as mascota FROM whatsapp_log l JOIN clientes c ON c.id=l.cliente_id LEFT JOIN mascotas m ON m.id=l.mascota_id ORDER BY l.created_at DESC LIMIT 50")->fetchAll();
@@ -95,8 +98,8 @@ $vac_alerta = $db->query("
   ORDER BY v.proxima_dosis LIMIT 10
 ")->fetchAll();
 
-$tipos_label = ['cita'=>'Confirmación cita','recibo'=>'Recibo','informe'=>'Informe médico','historial'=>'Historial','vacuna'=>'Recordatorio vacuna','recordatorio'=>'Recordatorio cita','receta'=>'Receta médica','personalizado'=>'Personalizado'];
-$tipos_badge = ['cita'=>'b-blue','recibo'=>'b-teal','informe'=>'b-red','historial'=>'b-gray','vacuna'=>'b-purple','recordatorio'=>'b-amber','receta'=>'b-green','personalizado'=>'b-gray'];
+$tipos_label = ['cita'=>'Confirmación cita','recibo'=>'Recibo','informe'=>'Informe médico','historial'=>'Historial','vacuna'=>'Recordatorio vacuna','recordatorio'=>'Recordatorio cita','receta'=>'Receta médica','grooming'=>'Grooming/Baño','personalizado'=>'Personalizado'];
+$tipos_badge = ['cita'=>'b-blue','recibo'=>'b-teal','informe'=>'b-red','historial'=>'b-gray','vacuna'=>'b-purple','recordatorio'=>'b-amber','receta'=>'b-green','grooming'=>'b-teal','personalizado'=>'b-gray'];
 
 // Nombre de la clínica/veterinaria desde configuración (para reemplazar "VetPro")
 $cfg = $db->query("SELECT clave,valor FROM configuracion")->fetchAll(PDO::FETCH_KEY_PAIR);
@@ -142,7 +145,7 @@ foreach ($cfg as $k => $v) {
       <div class="card mb-2">
         <div class="sec-title mb-1">1. Tipo de mensaje</div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px" id="type-grid">
-          <?php foreach(['cita'=>['📅','Confirmación cita'],'recibo'=>['🧾','Recibo/Boleta'],'informe'=>['🏥','Informe médico'],'historial'=>['📋','Historial clínico'],'vacuna'=>['💉','Recordatorio vacuna'],'recordatorio'=>['⏰','Recordatorio cita'],'receta'=>['💊','Receta médica'],'personalizado'=>['✏️','Personalizado']] as $k=>[$ico,$lbl]): ?>
+          <?php foreach(['cita'=>['📅','Confirmación cita'],'recibo'=>['🧾','Recibo/Boleta'],'informe'=>['🏥','Informe médico'],'historial'=>['📋','Historial clínico'],'vacuna'=>['💉','Recordatorio vacuna'],'recordatorio'=>['⏰','Recordatorio cita'],'receta'=>['💊','Receta médica'],'grooming'=>['✂️','Grooming/Baño'],'personalizado'=>['✏️','Personalizado']] as $k=>[$ico,$lbl]): ?>
           <div class="type-card <?= $pre_tipo===$k?'selected':'' ?>" onclick="selectType('<?= $k ?>')" id="tc-<?= $k ?>" style="border:1px solid var(--border);border-radius:8px;padding:12px;cursor:pointer;transition:all .15s;position:relative">
             <div style="position:absolute;top:6px;right:6px;width:16px;height:16px;border-radius:50%;background:var(--wa);display:<?= $pre_tipo===$k?'flex':'none' ?>;align-items:center;justify-content:center;font-size:10px;color:#fff" id="chk-<?= $k ?>">✓</div>
             <div style="font-size:20px;margin-bottom:5px"><?= $ico ?></div>
@@ -156,28 +159,25 @@ foreach ($cfg as $k => $v) {
       <div class="card mb-2">
         <div class="sec-title mb-1">2. Destinatario</div>
         <div class="form-row">
-          <div class="form-group">
+          <div class="form-group" style="position:relative">
             <label class="form-label">Cliente</label>
-            <select class="form-input" id="sel-cliente" onchange="loadCliente(this.value)">
-              <option value="">— Seleccionar —</option>
-              <?php foreach($clientes as $c): ?>
-              <option value="<?= $c['id'] ?>" data-tel="<?= clean($c['telefono']) ?>" <?= $pre_cliente==$c['id']?'selected':'' ?>><?= clean($c['nombre']) ?></option>
-              <?php endforeach; ?>
-            </select>
+            <input class="form-input" id="ac-cli-inp" autocomplete="off" placeholder="🔍 Escribe el nombre del cliente..."
+                   oninput="acCliFilter()" onfocus="acCliFilter()" onblur="acCliBlur()">
+            <input type="hidden" id="sel-cliente" value="" data-nombre="" data-tel="">
+            <div id="ac-cli-drop" style="display:none;position:absolute;z-index:70;left:0;right:0;top:100%;margin-top:2px;max-height:220px;overflow:auto;background:var(--bg2);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow-lg,0 10px 30px rgba(0,0,0,.12))"></div>
           </div>
           <div class="form-group">
             <label class="form-label">Teléfono WhatsApp</label>
             <input class="form-input" id="inp-tel" placeholder="+51 987 654 321" oninput="updatePreview()">
           </div>
         </div>
-        <div class="form-group">
+        <div class="form-group" style="position:relative">
           <label class="form-label">Mascota</label>
-          <select class="form-input" id="sel-mascota" onchange="updatePreview()">
-            <option value="">— Seleccionar mascota —</option>
-            <?php foreach($mascotas as $m): ?>
-            <option value="<?= $m['id'] ?>" data-cliente="<?= $m['cliente_id'] ?>" data-nombre="<?= clean($m['nombre']) ?>" <?= $pre_mascota==$m['id']?'selected':'' ?>><?= clean($m['nombre']) ?> (<?= clean($m['dueno']) ?>)</option>
-            <?php endforeach; ?>
-          </select>
+          <input class="form-input" id="ac-mas-inp" autocomplete="off" placeholder="🔍 Escribe el nombre de la mascota..."
+                 oninput="acMasFilter()" onfocus="acMasFilter()" onblur="acMasBlur()">
+          <input type="hidden" id="sel-mascota" value="" data-nombre="">
+          <div id="ac-mas-drop" style="display:none;position:absolute;z-index:70;left:0;right:0;top:100%;margin-top:2px;max-height:220px;overflow:auto;background:var(--bg2);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow-lg,0 10px 30px rgba(0,0,0,.12))"></div>
+          <div class="text-xs text-muted" id="ac-mas-hint" style="margin-top:4px"></div>
         </div>
       </div>
 
@@ -374,6 +374,7 @@ $tpl_default = [
   'vacuna'      => "💉 *Alerta de Vacuna — {clinica}*\n\nHola {nombre_cliente} 👋\n\nLa vacuna de *{nombre_mascota}* vence pronto:\n🗓️ *Vencimiento:* {proxima_vacuna}\n💉 {tipo_vacuna}\n\n👉 Agenda su cita respondiendo este mensaje.\n\n{clinica} 🐾",
   'recordatorio'=> "⏰ *Recordatorio {clinica}*\n\nHola {nombre_cliente} 👋\n\nMañana es la cita de *{nombre_mascota}*:\n📅 {fecha} a las {hora}\n👨‍⚕️ {veterinario}\n\n¿Confirmas tu asistencia?\nResponde *SÍ* o *NO*\n\n{clinica} 🐾",
   'receta'      => "💊 *Receta Médica — {clinica}*\n\nPaciente: *{nombre_mascota}*\nVet.: {veterinario}\nFecha: {fecha}\n\n📋 *Medicamentos:*\n• Amoxicilina 500mg — 1 comp c/12h x 7 días\n• Meloxicam — 1 vez al día con comida x 5 días\n\n{clinica} 🐾",
+  'grooming'    => "✂️ *Grooming — {clinica}*\n\nHola {nombre_cliente} 👋\n\n¡*{nombre_mascota}* ya está listo! 🛁✨\n\n🧼 *Servicio:* {servicio}\n📅 *Fecha:* {fecha}\n🕐 *Hora:* {hora}\n💰 *Total:* S/. {precio}\n\nPuedes pasar a recogerlo cuando gustes.\n\n{clinica} 🐾",
   'personalizado'=> "",
 ];
 // Aplicar encima las plantillas guardadas por el usuario
@@ -393,6 +394,7 @@ var EXTRA_FIELDS = {
   informe: '<div class="form-group mb-2"><label class="form-label">Diagnóstico</label><input class="form-input" id="ef-diag" placeholder="Diagnóstico clínico" oninput="updatePreview()"></div><div class="form-row mb-2"><div class="form-group"><label class="form-label">Veterinario</label><select class="form-input" id="ef-vet" onchange="updatePreview()"><?php foreach($veterinarios as $v): ?><option><?= clean($v['nombre']) ?></option><?php endforeach; ?></select></div><div class="form-group"><label class="form-label">Fecha consulta</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div></div>',
   recordatorio: '<div class="form-row mb-2"><div class="form-group"><label class="form-label">Fecha cita</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div><div class="form-group"><label class="form-label">Hora</label><input class="form-input" id="ef-hora" type="time" value="09:00" oninput="updatePreview()"></div></div><div class="form-group mb-2"><label class="form-label">Veterinario</label><select class="form-input" id="ef-vet" onchange="updatePreview()"><?php foreach($veterinarios as $v): ?><option><?= clean($v['nombre']) ?></option><?php endforeach; ?></select></div>',
   receta: '<div class="form-group mb-2"><label class="form-label">Veterinario</label><select class="form-input" id="ef-vet" onchange="updatePreview()"><?php foreach($veterinarios as $v): ?><option><?= clean($v['nombre']) ?></option><?php endforeach; ?></select></div><div class="form-group mb-2"><label class="form-label">Fecha receta</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div>',
+  grooming: '<div class="form-group mb-2"><label class="form-label">Servicio</label><select class="form-input" id="ef-servicio" onchange="groomPrecio()"><?php if(empty($serv_groom)): ?><option value="Baño y corte">Baño y corte</option><option value="Baño completo">Baño completo</option><option value="Corte de pelo">Corte de pelo</option><?php else: foreach($serv_groom as $s): ?><option value="<?= clean($s['nombre']) ?>" data-precio="<?= number_format($s['precio'],2,'.','') ?>"><?= clean($s['nombre']) ?> — S/ <?= number_format($s['precio'],2) ?></option><?php endforeach; endif; ?></select></div><div class="form-row mb-2"><div class="form-group"><label class="form-label">Fecha</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div><div class="form-group"><label class="form-label">Hora</label><input class="form-input" id="ef-hora" type="time" value="10:00" oninput="updatePreview()"></div></div><div class="form-group mb-2"><label class="form-label">Precio (S/.)</label><input class="form-input" id="ef-precio" type="number" step="0.01" value="0.00" oninput="updatePreview()"></div>',
   historial: '',
   personalizado: ''
 };
@@ -419,12 +421,10 @@ function getV(id) { const e=document.getElementById(id); return e?e.value:''; }
 
 function resolveMsg() {
   var tpl = document.getElementById('msg-text').value;
-  var cSel = document.getElementById('sel-cliente');
-  var cOpt = cSel ? cSel.options[cSel.selectedIndex] : null;
-  var cName = cOpt && cOpt.value ? cOpt.text.split(' · ')[0] : '[Cliente]';
-  var mSel = document.getElementById('sel-mascota');
-  var mOpt = mSel ? mSel.options[mSel.selectedIndex] : null;
-  var mName = mOpt && mOpt.value ? mOpt.getAttribute('data-nombre') || mOpt.text.split(' (')[0] : '[Mascota]';
+  var cH = document.getElementById('sel-cliente');
+  var cName = (cH && cH.value) ? (cH.getAttribute('data-nombre') || '[Cliente]') : '[Cliente]';
+  var mH = document.getElementById('sel-mascota');
+  var mName = (mH && mH.value) ? (mH.getAttribute('data-nombre') || '[Mascota]') : '[Mascota]';
   var fd = getV('ef-fecha');
   var fmtDate = fd ? new Date(fd+'T12:00').toLocaleDateString('es-PE',{day:'2-digit',month:'2-digit',year:'numeric'}) : '[Fecha]';
   var hr = getV('ef-hora');
@@ -444,7 +444,17 @@ function resolveMsg() {
     .replace(/\{total\}/g, getV('ef-total') || '0.00')
     .replace(/\{numero_boleta\}/g, getV('ef-nro') || 'B001-00001')
     .replace(/\{proxima_vacuna\}/g, fmtPv)
+    .replace(/\{servicio\}/g, getV('ef-servicio') || '[Servicio]')
+    .replace(/\{precio\}/g, getV('ef-precio') || '0.00')
     .replace(/\{tipo_vacuna\}/g, getV('ef-vacuna') || 'Vacuna');
+}
+
+// Al elegir un servicio de grooming, copiar su precio del catálogo
+function groomPrecio(){
+  var s=document.getElementById('ef-servicio');
+  if(s){ var o=s.options[s.selectedIndex]; var p=o?o.getAttribute('data-precio'):null;
+    var inp=document.getElementById('ef-precio'); if(inp && p) inp.value=p; }
+  updatePreview();
 }
 
 function buildURL() {
@@ -459,13 +469,14 @@ function updatePreview() {
   var display = msg.replace(/\*(.*?)\*/g,'$1').replace(/_(.*?)_/g,'$1');
   var el = document.getElementById('prev-msg');
   if (el) el.textContent = display || 'Escribe tu mensaje...';
-  var cSel = document.getElementById('sel-cliente');
-  var cOpt = cSel ? cSel.options[cSel.selectedIndex] : null;
-  if (cOpt && cOpt.value) {
-    var name = cOpt.text.split(' · ')[0];
-    var av = name.split(' ').map(n=>n[0]).join('').slice(0,2).toUpperCase();
-    var el2 = document.getElementById('prev-av'); if(el2) el2.textContent=av;
-    var el3 = document.getElementById('prev-name'); if(el3) el3.textContent=name;
+  var cH = document.getElementById('sel-cliente');
+  if (cH && cH.value) {
+    var name = cH.getAttribute('data-nombre') || '';
+    if (name) {
+      var av = name.split(' ').map(n=>n[0]).join('').slice(0,2).toUpperCase();
+      var el2 = document.getElementById('prev-av'); if(el2) el2.textContent=av;
+      var el3 = document.getElementById('prev-name'); if(el3) el3.textContent=name;
+    }
   }
   var tel = document.getElementById('inp-tel');
   if (tel && tel.value) { var e4=document.getElementById('prev-tel'); if(e4) e4.textContent=tel.value; }
@@ -474,13 +485,75 @@ function updatePreview() {
   if (el5) el5.textContent = url ? url.substring(0,100)+'...' : 'Completa teléfono y mensaje...';
 }
 
-function loadCliente(id) {
-  var sel = document.getElementById('sel-cliente');
-  var opt = sel ? sel.options[sel.selectedIndex] : null;
-  var tel = opt ? opt.getAttribute('data-tel') : '';
-  if (tel) { var inp = document.getElementById('inp-tel'); if(inp) inp.value = tel; }
+// ═══ Autocompletar Cliente / Mascota ═══
+var WA_CLIENTES = <?= json_encode(array_map(fn($c)=>['id'=>(int)$c['id'],'nombre'=>$c['nombre'],'tel'=>$c['telefono']], $clientes), JSON_UNESCAPED_UNICODE) ?>;
+var WA_MASCOTAS = <?= json_encode(array_map(fn($m)=>['id'=>(int)$m['id'],'nombre'=>$m['nombre'],'dueno'=>$m['dueno'],'cli'=>(int)$m['cliente_id'],'esp'=>$m['especie']], $mascotas), JSON_UNESCAPED_UNICODE) ?>;
+function _wEsc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function acCliFilter(){
+  var inp=document.getElementById('ac-cli-inp'), drop=document.getElementById('ac-cli-drop');
+  if(!inp||!drop) return;
+  var q=(inp.value||'').trim().toLowerCase();
+  var res=WA_CLIENTES.filter(function(c){ return q==='' || (c.nombre||'').toLowerCase().indexOf(q)>=0 || (c.tel||'').indexOf(q)>=0; }).slice(0,25);
+  drop.innerHTML = res.length ? res.map(function(c){
+      return '<div onmousedown="acCliPick('+c.id+')" style="padding:8px 11px;cursor:pointer;border-bottom:1px solid var(--border);font-size:13px">'
+        +'<strong>'+_wEsc(c.nombre)+'</strong>'+(c.tel?' <span style="color:var(--text3)">· '+_wEsc(c.tel)+'</span>':'')+'</div>';
+    }).join('') : '<div style="padding:9px 11px;font-size:12px;color:var(--text3)">Sin resultados</div>';
+  drop.style.display='block';
+}
+function acCliPick(id){
+  var c=WA_CLIENTES.filter(function(x){return x.id===id;})[0]; if(!c) return;
+  var inp=document.getElementById('ac-cli-inp'); if(inp) inp.value=c.nombre;
+  var h=document.getElementById('sel-cliente');
+  if(h){ h.value=c.id; h.setAttribute('data-nombre',c.nombre); h.setAttribute('data-tel',c.tel||''); }
+  var tel=document.getElementById('inp-tel'); if(tel && c.tel) tel.value=c.tel;
+  var d=document.getElementById('ac-cli-drop'); if(d) d.style.display='none';
+  // Si la mascota elegida no es de este cliente, se limpia
+  var mh=document.getElementById('sel-mascota');
+  if(mh && mh.value){
+    var m=WA_MASCOTAS.filter(function(x){return x.id==mh.value;})[0];
+    if(m && m.cli!==c.id) acMasClear();
+  }
+  var hint=document.getElementById('ac-mas-hint');
+  if(hint){ var n=WA_MASCOTAS.filter(function(x){return x.cli===c.id;}).length; hint.textContent = n ? '🐾 '+n+' mascota(s) registradas de este cliente' : ''; }
   updatePreview();
 }
+function acCliBlur(){ setTimeout(function(){ var d=document.getElementById('ac-cli-drop'); if(d) d.style.display='none'; },150); }
+
+function acMasClear(){
+  var h=document.getElementById('sel-mascota'); if(h){ h.value=''; h.setAttribute('data-nombre',''); }
+  var i=document.getElementById('ac-mas-inp'); if(i) i.value='';
+}
+function acMasFilter(){
+  var inp=document.getElementById('ac-mas-inp'), drop=document.getElementById('ac-mas-drop');
+  if(!inp||!drop) return;
+  var q=(inp.value||'').trim().toLowerCase();
+  var cid=parseInt((document.getElementById('sel-cliente')||{}).value||'0',10);
+  var base=WA_MASCOTAS;
+  // Si ya hay cliente elegido, priorizar sus mascotas
+  if(cid){ var suyas=base.filter(function(m){return m.cli===cid;}); if(suyas.length) base=suyas; }
+  var res=base.filter(function(m){ return q==='' || (m.nombre||'').toLowerCase().indexOf(q)>=0 || (m.dueno||'').toLowerCase().indexOf(q)>=0; }).slice(0,25);
+  drop.innerHTML = res.length ? res.map(function(m){
+      var ic=({perro:'🐕',gato:'🐈',conejo:'🐰',ave:'🐦',reptil:'🦎',roedor:'🐭'})[m.esp]||'🐾';
+      return '<div onmousedown="acMasPick('+m.id+')" style="padding:8px 11px;cursor:pointer;border-bottom:1px solid var(--border);font-size:13px">'
+        +ic+' <strong>'+_wEsc(m.nombre)+'</strong> <span style="color:var(--text3)">('+_wEsc(m.dueno)+')</span></div>';
+    }).join('') : '<div style="padding:9px 11px;font-size:12px;color:var(--text3)">Sin resultados</div>';
+  drop.style.display='block';
+}
+function acMasPick(id){
+  var m=WA_MASCOTAS.filter(function(x){return x.id===id;})[0]; if(!m) return;
+  var inp=document.getElementById('ac-mas-inp'); if(inp) inp.value=m.nombre;
+  var h=document.getElementById('sel-mascota');
+  if(h){ h.value=m.id; h.setAttribute('data-nombre',m.nombre); }
+  // Si no había cliente, se toma el dueño de la mascota
+  var ch=document.getElementById('sel-cliente');
+  if(ch && !ch.value){ acCliPick(m.cli); var ci=document.getElementById('ac-cli-inp'); if(ci) ci.value=m.dueno; }
+  var d=document.getElementById('ac-mas-drop'); if(d) d.style.display='none';
+  updatePreview();
+}
+function acMasBlur(){ setTimeout(function(){ var d=document.getElementById('ac-mas-drop'); if(d) d.style.display='none'; },150); }
+
+function loadCliente(id) { acCliPick(parseInt(id,10)); }
 
 function openWA() {
   var url = buildURL();
@@ -582,11 +655,10 @@ function waTab(n) {
 // Init
 selectType(currentType);
 <?php if($pre_cliente): ?>
-document.getElementById('sel-cliente').value = '<?= $pre_cliente ?>';
-loadCliente('<?= $pre_cliente ?>');
+acCliPick(<?= $pre_cliente ?>);
 <?php endif; ?>
 <?php if($pre_mascota): ?>
-document.getElementById('sel-mascota').value = '<?= $pre_mascota ?>';
+acMasPick(<?= $pre_mascota ?>);
 <?php endif; ?>
 updatePreview();
 </script>

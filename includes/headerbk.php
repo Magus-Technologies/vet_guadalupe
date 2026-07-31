@@ -14,12 +14,20 @@ try {
 } catch(Exception $e) { $citas_hoy = 0; }
 
 try {
-  $vac_venc = (int)$db->query("SELECT COUNT(*) FROM vacunas WHERE proxima_dosis < CURDATE()")->fetchColumn();
+  try {
+    $vac_venc = (int)$db->query("SELECT COUNT(*) FROM vacunas WHERE estado='aplicada' AND proxima_dosis < CURDATE()")->fetchColumn();
+  } catch(Exception $e) {
+    $vac_venc = (int)$db->query("SELECT COUNT(*) FROM vacunas WHERE proxima_dosis < CURDATE()")->fetchColumn();
+  }
   if ($vac_venc > 0) $alertas_data[] = ['tipo'=>'danger','msg'=>"$vac_venc vacuna".($vac_venc>1?'s':'')." vencida".($vac_venc>1?'s':''),'link'=>'vacunas','icon'=>'⚠️'];
 } catch(Exception $e) { $vac_venc = 0; }
 
 try {
-  $vac_prox = (int)$db->query("SELECT COUNT(*) FROM vacunas WHERE proxima_dosis BETWEEN CURDATE() AND DATE_ADD(CURDATE(),INTERVAL 7 DAY)")->fetchColumn();
+  try {
+    $vac_prox = (int)$db->query("SELECT COUNT(*) FROM vacunas WHERE estado='aplicada' AND proxima_dosis BETWEEN CURDATE() AND DATE_ADD(CURDATE(),INTERVAL 7 DAY)")->fetchColumn();
+  } catch(Exception $e) {
+    $vac_prox = (int)$db->query("SELECT COUNT(*) FROM vacunas WHERE proxima_dosis BETWEEN CURDATE() AND DATE_ADD(CURDATE(),INTERVAL 7 DAY)")->fetchColumn();
+  }
   if ($vac_prox > 0) $alertas_data[] = ['tipo'=>'warn','msg'=>"$vac_prox vacuna".($vac_prox>1?'s':'')." por vencer",'link'=>'vacunas','icon'=>'💉'];
 } catch(Exception $e) { $vac_prox = 0; }
 
@@ -52,6 +60,7 @@ try {
 $nav = [
   ['icon'=>'⊞', 'label'=>'Dashboard',       'page'=>'dashboard',   'section'=>'PRINCIPAL'],
   ['icon'=>'🗓️', 'label'=>'Citas / Agenda',   'page'=>'calendario',  'section'=>''],
+  ['icon'=>'📩', 'label'=>'Solicitudes', 'page'=>'solicitudes', 'section'=>''],
   ['icon'=>'👥', 'label'=>'Clientes',         'page'=>'clientes',    'section'=>''],
   ['icon'=>'🏥', 'label'=>'Veterinaria',      'page'=>'_vet_toggle', 'section'=>''],
   ['icon'=>'🐾', 'label'=>'Mascotas',         'page'=>'mascotas',    'section'=>'', 'sub'=>true],
@@ -65,6 +74,7 @@ $nav = [
   ['icon'=>'🚑', 'label'=>'Hospital/UCI',     'page'=>'hospital',    'section'=>''],
   ['icon'=>'✨', 'label'=>'Grooming',         'page'=>'grooming',    'section'=>'SERVICIOS'],
   ['icon'=>'🛒', 'label'=>'Pet Shop',         'page'=>'petshop',     'section'=>''],
+  ['icon'=>'🏷️', 'label'=>'Servicios',         'page'=>'servicios',   'section'=>''],
   ['icon'=>'💊', 'label'=>'Farmacia',         'page'=>'farmacia',    'section'=>'INVENTARIO'],
   ['icon'=>'📦', 'label'=>'Inventario',       'page'=>'inventario',  'section'=>''],
   ['icon'=>'🛒', 'label'=>'Compras',           'page'=>'compras',     'section'=>''],
@@ -90,9 +100,22 @@ $nav = [
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>VetPro — <?= clean($pageTitle) ?></title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="<?= BASE_URL ?>/public/css/main.css">
-<link rel="stylesheet" href="<?= BASE_URL ?>/public/css/mobile.css" media="screen and (max-width:768px)">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<?php
+/* Cache-busting de CSS: agrega ?v=<fecha de modificación del archivo> para que
+   el navegador descargue la versión nueva cada vez que editas el CSS, en lugar
+   de servir una copia cacheada. Busca la carpeta public/css esté donde esté
+   header.php; si no la encuentra, usa una versión manual de respaldo (súbela
+   cuando edites un CSS). */
+$__cssDir = null;
+foreach ([dirname(__DIR__).'/public/css', __DIR__.'/public/css', $_SERVER['DOCUMENT_ROOT'].'/public/css'] as $__d) {
+    if (is_dir($__d)) { $__cssDir = $__d; break; }
+}
+$__vMain = ($__cssDir && @filemtime("$__cssDir/main.css"))   ? filemtime("$__cssDir/main.css")   : '20260606';
+$__vMob  = ($__cssDir && @filemtime("$__cssDir/mobile.css")) ? filemtime("$__cssDir/mobile.css") : '20260606';
+?>
+<link rel="stylesheet" href="<?= BASE_URL ?>/public/css/main.css?v=<?= $__vMain ?>">
+<link rel="stylesheet" href="<?= BASE_URL ?>/public/css/mobile.css?v=<?= $__vMob ?>" media="screen and (max-width:768px)">
 <style>
 /* ── MOBILE OVERRIDE INLINE — sidebar drawer ──
    Sobreescribe cualquier regla vieja de main.css (@media 900px)
@@ -155,8 +178,8 @@ $nav = [
   .mob-overlay.active { display:block !important; }
   /* Hamburger */
   .mob-menu-btn { display:flex !important; align-items:center !important; justify-content:center !important; width:38px !important; height:38px !important; border-radius:10px !important; background:var(--bg3) !important; border:1.5px solid var(--border) !important; font-size:20px !important; cursor:pointer !important; flex-shrink:0 !important; }
-  /* Content */
-  .content { flex:1 !important; overflow-y:auto !important; padding:12px !important; -webkit-overflow-scrolling:touch !important; }
+  /* Content — padding-bottom amplio para que el último contenido no quede tapado por la barra inferior fija (60px) ni la zona de gestos del navegador */
+  .content { flex:1 !important; overflow-y:auto !important; padding:12px 12px 90px !important; -webkit-overflow-scrolling:touch !important; }
   /* Bottom nav */
   .mob-bottom-nav { display:flex !important; position:fixed !important; bottom:0 !important; left:0 !important; right:0 !important; height:60px !important; background:var(--bg2) !important; border-top:1px solid var(--border) !important; z-index:1000 !important; align-items:stretch !important; }
   .mob-nav-item { flex:1 !important; display:flex !important; flex-direction:column !important; align-items:center !important; justify-content:center !important; gap:2px !important; text-decoration:none !important; color:var(--text3) !important; font-size:9px !important; font-weight:600 !important; border:none !important; background:none !important; cursor:pointer !important; position:relative !important; -webkit-tap-highlight-color:transparent !important; }
@@ -168,6 +191,15 @@ $nav = [
   .form-row,.form-row-3 { grid-template-columns:1fr !important; }
   input, select, textarea { font-size:16px !important; }
 }
+
+/* Tablet y escritorio (≥769px): garantizar suficiente espacio inferior en el
+   área de contenido para que el final de los formularios largos (botones
+   Guardar/Cancelar) y de las fichas largas (ej. ficha de la mascota) sea
+   siempre alcanzable al hacer scroll. Antes la tablet tenía solo 40px y se
+   cortaba el último bloque. */
+@media (min-width:769px) {
+  .content { padding-bottom:110px !important; }
+}
 </style>
 </head>
 <body>
@@ -176,8 +208,19 @@ $nav = [
 <div class="mob-overlay" id="mobOverlay" onclick="closeMobMenu()"></div>
 
 <nav class="sidebar" id="mainSidebar">
+
+ <?php
+    $__cfg_logo = '';
+    try { $__cfg_logo = trim((string) getDB()->query("SELECT valor FROM configuracion WHERE clave='logo_path' LIMIT 1")->fetchColumn()); } catch (Exception $e) {}
+  ?>
   <div class="sidebar-logo">
-    <div class="logo-icon">🐾</div>
+    <div class="logo-icon" style="overflow:hidden">
+      <?php if ($__cfg_logo !== ''): ?>
+        <img src="<?= UPLOADS_URL.'/'.htmlspecialchars($__cfg_logo) ?>" alt="VetPro"
+             style="width:100%;height:100%;object-fit:contain;background:#fff;border-radius:inherit;padding:2px"
+             onerror="this.style.display='none';this.parentNode.textContent='🐾'">
+      <?php else: ?>🐾<?php endif; ?>
+    </div>
     <div>
       <div class="logo-text">VetPro</div>
       <div class="logo-sub">Sistema Veterinario</div>
@@ -190,6 +233,12 @@ $nav = [
   $in_vet_sub = false;
 
   foreach ($nav as $item) {
+    // Ocultar del menú los módulos que el rol no puede ver (admin ve todo).
+    $pg = $item['page'] ?? '';
+    $_sin_check = ['_vet_toggle','portal','buscar','evolucion','whatsapp_conexion'];
+    if ($pg !== '' && !in_array($pg, $_sin_check, true) && function_exists('canView') && !canView($pg)) {
+        continue;
+    }
     // Sección
     if (!empty($item['section']) && $item['section'] !== $lastSec) {
       if ($in_vet_sub) { echo '</div>'; $in_vet_sub = false; }
@@ -336,7 +385,7 @@ $nav = [
       foreach (array_slice($alertas_data, 0, 3) as $al):
         $st2 = $alert_styles[$al['tipo']] ?? $alert_styles['info'];
       ?>
-      <a href="<?= BASE_URL ?>/index.php?p=<?= $al['link'] ?>" title="Ver detalles"
+      <a href="<?= BASE_URL ?>/index.php?p=<?= $al['link'] ?>" title="Ver detalles" class="mob-hide"
          style="display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:999px;
                 text-decoration:none;background:<?= $st2['bg'] ?>;border:1.5px solid <?= $st2['border'] ?>;
                 color:<?= $st2['color'] ?>;font-size:12px;font-weight:600;white-space:nowrap"
@@ -390,5 +439,45 @@ $nav = [
       <a href="<?= BASE_URL ?>/index.php?p=citas&action=nueva" class="btn btn-primary btn-sm">＋ Nueva Atención</a>
     </div>
   </div>
+
+<script>
+/* Submenú "Veterinaria" (Mascotas / Ganado vacuno):
+   El onclick inline llama a toggleVetMenu(), que vive en un JS externo y en
+   móvil no responde. Aquí enganchamos el clic directamente sobre el item, sin
+   depender de esa función, para que el desplegable funcione siempre. */
+(function () {
+  function initVetToggle() {
+    var caret = document.getElementById('vet-caret');
+    var toggle = caret ? caret.closest('.nav-item') : null;
+    var submenu = document.getElementById('vet-submenu');
+    if (!toggle || !submenu) return;
+    if (toggle.dataset.vetBound === '1') return;   // evitar doble enganche
+    toggle.dataset.vetBound = '1';
+    toggle.removeAttribute('onclick');             // quitar el handler roto/ausente
+    toggle.style.cursor = 'pointer';
+    toggle.addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var oculto = getComputedStyle(submenu).display === 'none';
+      submenu.style.display = oculto ? 'block' : 'none';
+      if (caret) caret.textContent = oculto ? '∧' : '∨';
+    });
+  }
+  // Define también el global por si algún onclick inline lo invoca
+  window.toggleVetMenu = function () {
+    var submenu = document.getElementById('vet-submenu');
+    var caret = document.getElementById('vet-caret');
+    if (!submenu) return;
+    var oculto = getComputedStyle(submenu).display === 'none';
+    submenu.style.display = oculto ? 'block' : 'none';
+    if (caret) caret.textContent = oculto ? '∧' : '∨';
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initVetToggle);
+  } else {
+    initVetToggle();
+  }
+})();
+</script>
 
   <div class="content">

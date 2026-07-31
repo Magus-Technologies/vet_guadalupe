@@ -68,6 +68,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (strlen($ruc) !== 11) {
                 $msg = 'cli_factura_ruc'; $action = 'nueva'; $save_blocked = true;
             }
+        } elseif ($tipo === 'boleta') {
+            // BOLETA: si el cliente se identifica solo con RUC, este debe ser de
+            // persona natural (RUC 10). RUC 20 (persona jurídica) exige factura.
+            $st = $db->prepare("SELECT COALESCE(dni,'') dni, COALESCE(ce,'') ce, COALESCE(pasaporte,'') pasaporte, COALESCE(ruc,'') ruc FROM clientes WHERE id=?");
+            $st->execute([$cliente_id]);
+            $cdoc = $st->fetch();
+            $sin_otro_doc = strlen(trim($cdoc['dni'])) !== 8
+                && strlen(trim($cdoc['ce'])) < 9
+                && trim($cdoc['pasaporte']) === '';
+            $ruc = trim($cdoc['ruc']);
+            if ($sin_otro_doc && strlen($ruc) === 11 && substr($ruc, 0, 2) === '20') {
+                $msg = 'cli_boleta_ruc20'; $action = 'nueva'; $save_blocked = true;
+            }
         }
         if ($save_blocked) {
             // No procesamos el resto del bloque save; el form se vuelve a renderizar con $msg.
@@ -210,7 +223,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($pa === 'anular') {
-        $db->prepare("UPDATE ventas SET estado='anulado' WHERE id=?")->execute([(int)$_POST['id']]);
+        $anular_id = (int)$_POST['id'];
+
+        // Un comprobante ya emitido a SUNAT no se da de baja con un UPDATE:
+        // requiere nota de crédito. Se redirige en vez de anular a ciegas.
+        $st = $db->prepare("SELECT sunat_xml FROM ventas WHERE id=?");
+        $st->execute([$anular_id]);
+        if (!empty($st->fetchColumn())) {
+            header('Location: '.BASE_URL.'/index.php?p=notas_credito&action=nueva&venta_id='.$anular_id);
+            exit;
+        }
+
+        $db->prepare("UPDATE ventas SET estado='anulado' WHERE id=?")->execute([$anular_id]);
+        // Descuenta de la caja abierta lo que esta venta había ingresado.
+        $tuvo_ingreso = (int)$db->query("SELECT COUNT(*) FROM movimientos_caja WHERE tipo='ingreso' AND venta_id=".$anular_id)->fetchColumn();
+        $egresos = registrarEgresoAnulacion($db, $anular_id, (int)$user['id'], 'Anulación');
+        if ($tuvo_ingreso > 0 && $egresos === 0) {
+            $_SESSION['flash_error'] = 'Venta anulada, pero NO se descontó de caja: no hay una caja abierta. Registra el egreso manualmente al abrir la próxima.';
+        }
         $msg='anulado'; $action='list';
     }
     if ($pa === 'cobrar') {
@@ -394,6 +424,7 @@ $_sunat_msg   = clean($_GET['sunat_msg'] ?? '');
 <?php if(($msg??'')==='cobrado'): ?><div class="alert alert-success mb-2">✅ Pago registrado.</div><?php endif; ?>
 <?php if(($msg??'')==='cli_factura_req'): ?><div class="alert alert-warn mb-2">⚠️ Para emitir una <strong>factura</strong> debes seleccionar un cliente con RUC válido.</div><?php endif; ?>
 <?php if(($msg??'')==='cli_factura_ruc'): ?><div class="alert alert-warn mb-2">⚠️ El cliente seleccionado no tiene <strong>RUC válido</strong>. La factura requiere RUC de 11 dígitos. Edita el cliente o emite una boleta.</div><?php endif; ?>
+<?php if(($msg??'')==='cli_boleta_ruc20'): ?><div class="alert alert-warn mb-2">⚠️ El cliente tiene <strong>RUC 20 (persona jurídica)</strong>. A una empresa le corresponde <strong>factura</strong>, no boleta.</div><?php endif; ?>
 <?php if(($msg??'')==='error_items'): ?><div class="alert alert-warn mb-2">⚠️ Debes agregar al menos un ítem con precio mayor a 0.</div><?php endif; ?>
 
 <?php if($action==='nueva'): ?>
@@ -424,16 +455,24 @@ if (isset($_SESSION['flash_error'])) {
 ?>
 <div class="card" style="max-width:1400px;width:100%">
   <div class="sec-header mb-3"><div class="sec-title">Nueva Venta</div><a href="?p=facturacion" class="btn btn-sm btn-ghost">← Volver</a></div>
-  <form method="POST" id="venta-form">
+ 
+<style>
+@media (max-width: 600px){
+  .cli-mas-grid{ grid-template-columns:1fr !important; }
+}
+</style>
+
+
+ <form method="POST" id="venta-form">
     <input type="hidden" name="action" value="save">
 
     <div class="form-body" style="display:grid;grid-template-columns:1fr 340px;gap:16px;align-items:start">
       <div class="form-col-left"><!-- COLUMNA IZQUIERDA -->
         <!-- CLIENTE + MASCOTA -->
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+        <div class="cli-mas-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
           <div class="form-group" style="position:relative">
             <label class="form-label">Cliente <span style="color:var(--text3);font-weight:400">(opcional para boleta/nota)</span></label>
-            <div style="display:flex;gap:6px;align-items:center">
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
               <select id="sel-tipodoc" onchange="actualizarPlaceHolderDoc()" style="border:1.5px solid var(--border);border-radius:8px;padding:7px 10px;background:var(--bg2);color:var(--text);font-size:13px;flex-shrink:0;min-width:100px">
                 <option value="dni">DNI</option>
                 <option value="ruc">RUC</option>
@@ -442,7 +481,7 @@ if (isset($_SESSION['flash_error'])) {
               </select>
               <input type="text" id="cli-busq" class="form-input" placeholder="🔍 Ingresa el número..."
                      autocomplete="off" oninput="buscarCliente(this.value)" onfocus="buscarCliente(this.value)"
-                     onblur="setTimeout(function(){document.getElementById('cli-drop').style.display='none'},200)" style="flex:1">
+                     onblur="setTimeout(function(){document.getElementById('cli-drop').style.display='none'},200)" style="flex:1;min-width:120px">
               <button type="button" id="btnCliSearch" onclick="btnBuscarCliente()"
                       title="Consultar RENIEC o SUNAT"
                       style="background:var(--primary);border:none;border-radius:8px;cursor:pointer;font-size:14px;padding:7px 12px;color:white;flex-shrink:0">🔍</button>
@@ -839,11 +878,17 @@ if (isset($_SESSION['flash_error'])) {
 
   <!-- ANULAR -->
   <?php if($venta_detalle['estado']==='pagado'): ?>
+  <?php if(!empty($venta_detalle['sunat_xml'])): ?>
+    <!-- Comprobante electrónico: ante SUNAT solo se da de baja con nota de crédito. -->
+    <a href="?p=notas_credito&action=nueva&venta_id=<?= $venta_detalle['id'] ?>"
+       class="btn btn-xs mb-2" style="color:var(--red);display:inline-flex">✕ Anular (nota de crédito)</a>
+  <?php else: ?>
   <form method="POST" class="mb-2" style="display:inline">
     <input type="hidden" name="action" value="anular">
     <input type="hidden" name="id" value="<?= $venta_detalle['id'] ?>">
     <button type="submit" class="btn btn-xs" style="color:var(--red)" onclick="return confirm('¿Anular este comprobante? Esta acción no se puede deshacer.')">✕ Anular comprobante</button>
   </form>
+  <?php endif; ?>
   <?php endif; ?>
 
   <!-- WHATSAPP CON URL -->
@@ -1459,9 +1504,11 @@ function addItem(tipo) {
       <input type="hidden" name="item_ref[]"  id="ref_${idx}" value="">
       <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
         <span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;${tagStyle};white-space:nowrap">${tipo === 'petshop' ? '🛒' : tipo === 'producto' ? '📦' : '🏥'} ${labelTipo.charAt(0).toUpperCase()+labelTipo.slice(1)}</span>
-        <select class="form-input" style="font-size:12px;flex:1" onchange="fillItem(this,${idx})">
-          <option value="">— Seleccionar ${labelTipo} —</option>${opts}
-        </select>
+        <div style="position:relative;flex:1">
+          <input class="form-input ac-input" id="ac_${idx}" autocomplete="off" placeholder="Escribe para buscar ${labelTipo}…" style="font-size:12px;width:100%"
+                 oninput="acFilter(${idx},'${tipoInterno}')" onfocus="acFilter(${idx},'${tipoInterno}')" onblur="acBlur(${idx})" onkeydown="acKey(event,${idx},'${tipoInterno}')">
+          <div class="ac-drop" id="acd_${idx}" style="display:none;position:absolute;z-index:60;left:0;right:0;top:calc(100% + 2px);max-height:230px;overflow:auto;background:var(--bg2);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow-lg,0 10px 30px rgba(0,0,0,.12))"></div>
+        </div>
       </div>
       <input class="form-input" name="item_desc[]" id="desc_${idx}" value="" placeholder="Descripción" style="font-size:12px">
     </td>
@@ -1478,7 +1525,7 @@ function addItem(tipo) {
   `;
   document.getElementById('items-list').appendChild(row);
   showHeader();
-  row.querySelector('select').focus();
+  var _ac = row.querySelector('.ac-input'); if (_ac) _ac.focus();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1522,16 +1569,12 @@ function procesarEscaneo(codigoRaw) {
   } else {
     // Agregar nueva línea ya rellenada
     addItem(tipo);
-    // Tomar la última fila recién agregada
+    // Tomar la última fila recién agregada y rellenarla
     var ultima = document.querySelector('#items-list tr.item-row:last-child');
     if (ultima) {
-      var sel = ultima.querySelector('select');
-      // Seleccionar la opción del producto
-      for (var i=0; i<sel.options.length; i++) {
-        if (parseInt(sel.options[i].value,10) === prod.id) { sel.selectedIndex = i; break; }
-      }
-      // Disparar el rellenado de descripción y precio
-      sel.dispatchEvent(new Event('change', {bubbles:true}));
+      var refI = ultima.querySelector('input[name="item_ref[]"]');
+      var _ix  = refI ? parseInt((refI.id||'ref_0').split('_')[1],10) : NaN;
+      if (!isNaN(_ix)) acApply(_ix, tipo, prod.id);
     }
     fb.innerHTML = '<span style="color:#10b981">✓ Agregado: <b>'+prod.nombre.replace(/</g,'&lt;')+'</b> — S/. '+prod.precio.toFixed(2)+'</span>';
   }
@@ -1578,6 +1621,80 @@ function fillItem(sel, idx) {
   if (descEl)   descEl.value   = nombre;
   if (precioEl){ precioEl.value = precio.toFixed(2); calcSubtotal(idx); }
   calcTotal();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AUTOCOMPLETAR de ítems (servicio / producto / pet shop)
+// Filtra por nombre y código mientras se escribe.
+// ═══════════════════════════════════════════════════════════════
+(function(){ var s=document.createElement('style');
+  s.textContent='.ac-item:hover,.ac-item.active{background:var(--bg3,#f1f5f9)}';
+  document.head.appendChild(s);
+})();
+
+function acData(tipo){ return tipo==='servicio'?SERVICIOS:(tipo==='petshop'?PETSHOP:PRODUCTOS); }
+function _acEsc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
+
+function acFilter(idx, tipo){
+  var inp=document.getElementById('ac_'+idx), drop=document.getElementById('acd_'+idx);
+  if(!inp||!drop) return;
+  var qv=(inp.value||'').trim().toLowerCase();
+  var list=acData(tipo), res=[];
+  for(var i=0;i<list.length && res.length<25;i++){
+    var x=list[i], n=(x.nombre||'').toLowerCase(), c=(x.codigo||'').toLowerCase();
+    if(qv==='' || n.indexOf(qv)>=0 || (c && c.indexOf(qv)>=0)) res.push(x);
+  }
+  if(res.length===0){
+    drop.innerHTML='<div style="padding:9px 10px;font-size:12px;color:var(--text3)">Sin resultados</div>';
+    drop.removeAttribute('data-ids'); drop.style.display=''; return;
+  }
+  drop.innerHTML=res.map(function(x,i){
+    return '<div class="ac-item'+(i===0?' active':'')+'" onmousedown="acPick('+idx+',\''+tipo+'\','+x.id+')" '
+      +'style="padding:7px 10px;cursor:pointer;border-bottom:1px solid var(--border)">'
+      +'<div style="font-weight:600;font-size:12px">'+_acEsc(x.nombre)+'</div>'
+      +'<div style="font-size:11px;color:var(--text3)">S/ '+(x.precio||0).toFixed(2)+(x.codigo?' · '+_acEsc(x.codigo):'')+'</div></div>';
+  }).join('');
+  drop.setAttribute('data-ids', res.map(function(x){return x.id;}).join(','));
+  drop.setAttribute('data-active','0');
+  drop.style.display='';
+}
+
+function acApply(idx, tipo, id){
+  var list=acData(tipo), it=null;
+  for(var i=0;i<list.length;i++){ if(list[i].id===id){ it=list[i]; break; } }
+  if(!it) return;
+  var inp=document.getElementById('ac_'+idx), refEl=document.getElementById('ref_'+idx),
+      descEl=document.getElementById('desc_'+idx), precioEl=document.getElementById('precio_'+idx);
+  if(inp) inp.value=it.nombre;
+  if(refEl) refEl.value=it.id;
+  if(descEl) descEl.value=it.nombre;
+  if(precioEl){ precioEl.value=(it.precio||0).toFixed(2); calcSubtotal(idx); }
+  calcTotal();
+}
+
+function acPick(idx, tipo, id){
+  acApply(idx, tipo, id);
+  var drop=document.getElementById('acd_'+idx); if(drop) drop.style.display='none';
+}
+
+function acBlur(idx){
+  var drop=document.getElementById('acd_'+idx);
+  setTimeout(function(){ if(drop) drop.style.display='none'; }, 150);
+}
+
+function acKey(e, idx, tipo){
+  var drop=document.getElementById('acd_'+idx);
+  if(!drop || drop.style.display==='none'){ if(e.key==='ArrowDown') acFilter(idx,tipo); return; }
+  var items=drop.querySelectorAll('.ac-item'); if(!items.length) return;
+  var act=parseInt(drop.getAttribute('data-active')||'0',10);
+  if(e.key==='ArrowDown'){ e.preventDefault(); act=Math.min(items.length-1,act+1); }
+  else if(e.key==='ArrowUp'){ e.preventDefault(); act=Math.max(0,act-1); }
+  else if(e.key==='Enter'){ e.preventDefault(); var ids=(drop.getAttribute('data-ids')||'').split(','); if(ids[act]!==undefined&&ids[act]!=='') acPick(idx,tipo,parseInt(ids[act],10)); return; }
+  else if(e.key==='Escape'){ drop.style.display='none'; return; }
+  else return;
+  items.forEach(function(el,i){ el.classList.toggle('active', i===act); });
+  drop.setAttribute('data-active', act);
+  if(items[act]) items[act].scrollIntoView({block:'nearest'});
 }
 
 function calcSubtotal(idx) {

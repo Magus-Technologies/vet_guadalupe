@@ -14,8 +14,8 @@ if (!defined('WA_MICRO_URL')) {
      *   /vet2 → puerto 3032, token de vet2
      *   /vet3 → puerto 3033, token de vet3
      */
-    define('WA_MICRO_URL',   getenv('WA_MICRO_URL')   ?: 'http://127.0.0.1:3031');
-    define('WA_MICRO_TOKEN', getenv('WA_MICRO_TOKEN') ?: 'magus123technologies456');
+    define('WA_MICRO_URL',   getenv('WA_MICRO_URL')   ?: 'http://127.0.0.1:3035');
+    define('WA_MICRO_TOKEN', getenv('WA_MICRO_TOKEN') ?: 'magus123technologies460');
 }
 
 /**

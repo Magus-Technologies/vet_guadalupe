@@ -28,7 +28,7 @@ function ps_leer_excel_xml($raw) {
             if ($data !== null && count($data)) $val = (string)$data;
             $celdas[$colIdx] = $val; $colIdx++;
         }
-        if ($celdas) { ksort($celdas); $filas[] = array_values($celdas); }
+        if ($celdas) { ksort($celdas); $_max=max(array_keys($celdas)); $_fila=[]; for($_j=0;$_j<=$_max;$_j++) $_fila[$_j]=$celdas[$_j]??""; $filas[] = $_fila; }
     }
     return $filas;
 }
@@ -76,7 +76,7 @@ function ps_leer_xlsx($path) {
             elseif ($tipo === 'inlineStr' && isset($c->is->t)) { $v = (string)$c->is->t; }
             $celdas[$colIdx] = $v; $colIdx++;
         }
-        if ($celdas) { ksort($celdas); $filas[] = array_values($celdas); }
+        if ($celdas) { ksort($celdas); $_max=max(array_keys($celdas)); $_fila=[]; for($_j=0;$_j<=$_max;$_j++) $_fila[$_j]=$celdas[$_j]??""; $filas[] = $_fila; }
     }
     return $filas;
 }
@@ -195,7 +195,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // ── IMPORTAR productos masivamente (XLSX / XML Excel / CSV / TSV) ──
     if ($pa === 'importar_productos') {
-        $importados = 0; $omitidos = 0; $err_imp = '';
+        $importados = 0; $omitidos = 0; $err_imp = ''; $errores_imp = []; $actualizados = 0;
         try {
             if (empty($_FILES['archivo']['tmp_name'])) throw new Exception('No se recibió ningún archivo.');
             $tmp = $_FILES['archivo']['tmp_name'];
@@ -233,6 +233,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  VALUES (?,?,?,?,?,?,?,?,?,?".($tiene_sede ? ",?" : "").")"
             );
 
+            // UPSERT: buscar existente por código de barras (o nombre) para ACTUALIZAR en vez de duplicar
+            $sedeCond = $tiene_sede ? " AND sede_id=?" : "";
+            $find_cb  = $db->prepare("SELECT id FROM petshop_productos WHERE codigo_barras=? AND codigo_barras<>''$sedeCond LIMIT 1");
+            $find_nom = $db->prepare("SELECT id FROM petshop_productos WHERE nombre=?$sedeCond LIMIT 1");
+            $upd = $db->prepare(
+                "UPDATE petshop_productos SET categoria=?, nombre=?, descripcion=?, marca=?, contenido=?,
+                    codigo_barras=COALESCE(NULLIF(?,''),codigo_barras),
+                    precio_costo=?, precio_venta=?, stock=?, stock_minimo=? WHERE id=?"
+            );
+
+            // Parseo robusto de precios: soporta "1,500.00", "1.500,00", "S/ 1500", "1500", "25,90"
+            $fm_num = function($s) {
+                $s = trim((string)$s);
+                $s = preg_replace('/[^\d.,\-]/', '', $s);
+                if ($s === '' || $s === '-') return 0.0;
+                $lc = strrpos($s, ','); $ld = strrpos($s, '.');
+                if ($lc !== false && $ld !== false) {
+                    if ($lc > $ld) { $s = str_replace('.', '', $s); $s = str_replace(',', '.', $s); }
+                    else           { $s = str_replace(',', '', $s); }
+                } elseif ($lc !== false) {
+                    if (preg_match('/,\d{1,2}$/', $s)) $s = str_replace(',', '.', $s);
+                    else                               $s = str_replace(',', '', $s);
+                }
+                return (float)$s;
+            };
+            $MAX_DECIMAL = 99999999.99; // tope de DECIMAL(10,2)
+
             foreach ($filas as $i => $f) {
                 // Normalizar a 10 columnas
                 $f = array_map(fn($v)=>trim((string)$v), $f);
@@ -248,23 +275,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $descripcion = $f[2] ?? '';
                 $marca       = $f[3] ?? '';
                 $contenido   = $f[4] ?? '';
-                $p_costo     = (float)str_replace([',','S/','s/',' '],['.','','',''], $f[5] ?? '0');
-                $p_venta     = (float)str_replace([',','S/','s/',' '],['.','','',''], $f[6] ?? '0');
+                $p_costo     = $fm_num($f[5] ?? '0');
+                $p_venta     = $fm_num($f[6] ?? '0');
                 $stock       = (int)($f[7] ?? 0);
                 $stock_min   = (int)($f[8] ?? 5);
                 $cod_barras  = $f[9] ?? '';
 
-                $params = [$categoria,$nombre,$descripcion,$marca,$contenido,$p_costo,$p_venta,$stock,$stock_min,$cod_barras];
-                if ($tiene_sede) $params[] = $sede_destino;
-                $ins->execute($params);
-                $importados++;
+                // Validar rango de precios (DECIMAL(10,2)) para evitar el error 1264
+                if ($p_costo < 0) $p_costo = 0;
+                if ($p_venta < 0) $p_venta = 0;
+                if ($p_costo > $MAX_DECIMAL || $p_venta > $MAX_DECIMAL) {
+                    $omitidos++;
+                    $errores_imp[] = "«{$nombre}»: precio fuera de rango (costo ".number_format($p_costo,2).", venta ".number_format($p_venta,2)."). Revisa que el código de barras no esté en la columna de precio y que las columnas sigan el orden de la plantilla.";
+                    continue;
+                }
+
+                try {
+                    // ¿ya existe? por código de barras; si no, por nombre (misma sede)
+                    $pid = 0;
+                    if ($cod_barras !== '') { $find_cb->execute($tiene_sede ? [$cod_barras,$sede_destino] : [$cod_barras]); $pid = (int)($find_cb->fetchColumn() ?: 0); }
+                    if (!$pid)              { $find_nom->execute($tiene_sede ? [$nombre,$sede_destino] : [$nombre]);         $pid = (int)($find_nom->fetchColumn() ?: 0); }
+
+                    if ($pid) {
+                        $upd->execute([$categoria,$nombre,$descripcion,$marca,$contenido,$cod_barras,$p_costo,$p_venta,$stock,$stock_min,$pid]);
+                        $actualizados++;
+                    } else {
+                        $params = [$categoria,$nombre,$descripcion,$marca,$contenido,$p_costo,$p_venta,$stock,$stock_min,$cod_barras];
+                        if ($tiene_sede) $params[] = $sede_destino;
+                        $ins->execute($params);
+                        $importados++;
+                    }
+                } catch (Exception $eRow) {
+                    $omitidos++;
+                    $errores_imp[] = "«{$nombre}»: ".$eRow->getMessage();
+                }
             }
         } catch(Exception $e) {
             $err_imp = $e->getMessage();
         }
         // Resultado por URL (PRG) para refrescar la lista
-        $qs = 'p=petshop&imp='.$importados.'&om='.$omitidos;
+        $qs = 'p=petshop&imp='.$importados.'&act='.$actualizados.'&om='.$omitidos;
         if ($err_imp) $qs .= '&imperr='.urlencode(substr($err_imp,0,200));
+        if (!empty($errores_imp)) $qs .= '&impdet='.urlencode(substr(implode(' • ', array_slice($errores_imp,0,4)),0,500));
         if (!headers_sent()) { header('Location: '.BASE_URL.'/index.php?'.$qs); exit; }
         echo '<script>location.href='.json_encode(BASE_URL.'/index.php?'.$qs).';</script>'; exit;
     }
@@ -602,8 +654,9 @@ document.addEventListener('DOMContentLoaded', function(){
 <?php if (isset($_GET['imp'])): ?>
 <div class="card" style="margin-bottom:14px;padding:13px 16px;background:#f0fdf4;border-left:3px solid #10b981">
   <div style="font-size:13px;color:#065f46">
-    ✅ Importación completada: <strong><?= (int)$_GET['imp'] ?></strong> producto(s) agregado(s)<?= (int)($_GET['om']??0) ? ', '.(int)$_GET['om'].' omitido(s) (sin nombre)' : '' ?>.
+    ✅ Importación completada: <strong><?= (int)$_GET['imp'] ?></strong> agregado(s)<?= (int)($_GET['act']??0) ? ', <strong>'.(int)$_GET['act'].'</strong> actualizado(s)' : '' ?><?= (int)($_GET['om']??0) ? ', '.(int)$_GET['om'].' omitido(s)' : '' ?>.
     <?php if(!empty($_GET['imperr'])): ?><br><span style="color:#b91c1c">⚠️ <?= clean($_GET['imperr']) ?></span><?php endif; ?>
+    <?php if(!empty($_GET['impdet'])): ?><br><span style="color:#b45309;font-size:12px">Filas no importadas → <?= clean($_GET['impdet']) ?></span><?php endif; ?>
   </div>
 </div>
 <?php endif; ?>

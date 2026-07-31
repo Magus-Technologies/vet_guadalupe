@@ -435,10 +435,18 @@ try{$n_hosp=$db->prepare("SELECT COUNT(*) FROM hospitalizaciones WHERE mascota_i
         </div>
         <?php $vacs=$db->prepare("SELECT * FROM vacunas WHERE mascota_id=? ORDER BY fecha_aplicacion DESC");$vacs->execute([$m['id']]);$vacs=$vacs->fetchAll();
         if(empty($vacs)): ?><div style="text-align:center;padding:32px;color:var(--text3);font-size:12px">Sin vacunas registradas.</div>
-        <?php else: foreach($vacs as $v):$dias=ceil((strtotime($v['proxima_dosis'])-time())/86400);$vc=$dias<0?'b-danger':($dias<=7?'b-warning':'b-success'); ?>
+        <?php else: foreach($vacs as $v):
+          if(!empty($v['proxima_dosis'])){
+            $dias=ceil((strtotime($v['proxima_dosis'])-time())/86400);
+            $fprox=date('d/m/Y',strtotime($v['proxima_dosis']));
+            if($dias<0){ $vc='b-danger'; $vtxt="Vencida: $fprox"; }
+            elseif($dias<=30){ $vc='b-warning'; $vtxt="Por vencer: $fprox"; }
+            else{ $vc='b-success'; $vtxt="Atendido · Refuerzo: $fprox"; }
+          } else { $vc='b-success'; $vtxt='Atendido'; }
+        ?>
         <div class="flex items-center gap-10 mb-2" style="gap:10px;padding:10px;border:1px solid var(--border);border-radius:8px">
           <div style="flex:1"><div style="font-size:12px;font-weight:600"><?= clean($v['tipo_vacuna']) ?></div><div style="font-size:11px;color:var(--text3)">Aplicada: <?= date('d/m/Y',strtotime($v['fecha_aplicacion'])) ?></div></div>
-          <span class="badge <?= $vc ?>"><?= $dias<0?'Vencida':"Vence: ".date('d/m/Y',strtotime($v['proxima_dosis'])) ?></span>
+          <span class="badge <?= $vc ?>"><?= $vtxt ?></span>
         </div>
         <?php endforeach; endif; ?>
       </div>

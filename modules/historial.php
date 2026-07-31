@@ -56,6 +56,25 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['action']??'')==='save_consul
     $data=[]; foreach($fields as $f) $data[$f]=trim($_POST[$f]??'')?:null;
     $data['cita_id']=$cita_id?:null;
     $data['sede_id']=$user['sede_id']??1;
+
+    // ── Normalizar datos para que no choquen con la BD ──
+    // fecha: datetime-local manda "2026-07-17T10:30" -> "2026-07-17 10:30"
+    if (!empty($data['fecha'])) $data['fecha'] = str_replace('T',' ',$data['fecha']);
+    if (empty($data['fecha']))  $data['fecha'] = date('Y-m-d H:i:s');
+    // tipo: debe existir en el ENUM de consultas
+    $_tipos_hc = ['consulta','control','emergencia','cirugia','vacuna','hospitalizacion'];
+    $_t = strtr(strtolower(trim((string)($data['tipo'] ?? 'consulta'))), ['á'=>'a','é'=>'e','í'=>'i','ó'=>'o','ú'=>'u','ñ'=>'n']);
+    $data['tipo'] = in_array($_t, $_tipos_hc, true) ? $_t : 'consulta';
+
+    // ── Validar obligatorios (columnas NOT NULL) para no reventar en blanco ──
+    $_mid = (int)($data['mascota_id'] ?? 0);
+    $_vid = (int)($data['veterinario_id'] ?? 0);
+    if (!$_mid || !$_vid) {
+        $_falta = !$_mid ? 'mascota' : 'veterinario';
+        header('Location: '.BASE_URL.'/index.php?p=historial&mascota_id='.$_mid.'&msg=err&e='.urlencode('Falta seleccionar el '.$_falta.'. Vuelve a elegirlo en el buscador y guarda de nuevo.'));
+        exit;
+    }
+
     // Firma digital y extras
     $firma = trim($_POST['firma_veterinario']??'');
     $nota_voz = trim($_POST['nota_voz_texto']??'');
@@ -69,42 +88,96 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['action']??'')==='save_consul
     try { $r=$db->query("SHOW COLUMNS FROM consultas LIKE 'plantilla_usada'")->fetchAll(); if(empty($r)) $db->exec("ALTER TABLE consultas ADD COLUMN plantilla_usada VARCHAR(100)"); } catch(Exception $e){}
     $cols=implode(',',array_merge($fields,['cita_id','sede_id']));
     $pls=implode(',',array_map(fn($f)=>":$f",array_merge($fields,['cita_id','sede_id'])));
-    $st=$db->prepare("INSERT INTO consultas ($cols$extra_cols) VALUES ($pls$extra_pls)");
-    $st->execute(array_merge($data,$extra_data));
+    try {
+        $st=$db->prepare("INSERT INTO consultas ($cols$extra_cols) VALUES ($pls$extra_pls)");
+        $st->execute(array_merge($data,$extra_data));
+    } catch (Exception $e) {
+        // Nunca dejar pantalla en blanco: volver con el motivo exacto
+        header('Location: '.BASE_URL.'/index.php?p=historial&mascota_id='.$_mid.'&msg=err&e='.urlencode('No se pudo guardar la consulta: '.$e->getMessage()));
+        exit;
+    }
     $nueva_cid=(int)$db->lastInsertId();
     if($data['cita_id']) $db->prepare("UPDATE citas SET estado='atendida' WHERE id=?")->execute([$data['cita_id']]);
 
-    // ── Próximo control → crear cita automática en la agenda ──
-    // Si el veterinario indicó una fecha de próximo control, generamos una
-    // cita tipo 'control' para que aparezca en el calendario y en la lista.
+    // ── Próximo control → crear cita(s) automática(s) en la agenda ──
+    // Por defecto crea UN control en la fecha indicada. Si el vet marcó
+    // "Controles recurrentes", crea toda la serie agrupada.
     if (!empty($data['proximo_control'])) {
         try {
-            $fctrl = $data['proximo_control'];
-            // Evitar duplicar si ya hay una cita de control ese día para esta mascota
+            // Asegurar columnas de recurrencia (idempotente)
+            $_c = $db->query("SHOW COLUMNS FROM `citas` LIKE 'grupo_recurrencia'")->fetchAll();
+            if (empty($_c)) {
+                $db->exec("ALTER TABLE `citas`
+                    ADD COLUMN `grupo_recurrencia` VARCHAR(36) NULL,
+                    ADD COLUMN `sesion_numero` SMALLINT NULL,
+                    ADD COLUMN `total_sesiones` SMALLINT NULL");
+                $db->exec("CREATE INDEX idx_citas_grupo ON `citas` (`grupo_recurrencia`)");
+            }
+
+            $base = $data['proximo_control'];
+            $recur = !empty($_POST['pc_recurrente']);
+            $n = $recur ? max(2, min(52, (int)($_POST['pc_total_sesiones'] ?? 0))) : 1;
+
+            // UUID de grupo solo si es serie
+            $grupo = null;
+            if ($recur) {
+                $b = random_bytes(16);
+                $b[6] = chr((ord($b[6]) & 0x0f) | 0x40);
+                $b[8] = chr((ord($b[8]) & 0x3f) | 0x80);
+                $grupo = vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($b), 4));
+            }
+
+            // Calcular fechas
+            $frec = $_POST['pc_frecuencia'] ?? 'semanal';
+            $cada = max(1, (int)($_POST['pc_cada_dias'] ?? 1));
+            $fechas = [];
+            for ($i = 0; $i < $n; $i++) {
+                if (!$recur) { $fechas[] = $base; break; }
+                if ($frec === 'mensual') {
+                    if (!function_exists('_vp_add_months')) {
+                        function _vp_add_months($base, $i) {
+                            $ts = strtotime($base);
+                            $y=(int)date('Y',$ts); $m=(int)date('n',$ts); $d=(int)date('j',$ts);
+                            $m += $i; $y += intdiv($m-1,12); $m = (($m-1)%12)+1;
+                            $maxd = (int)date('t', strtotime(sprintf('%04d-%02d-01',$y,$m)));
+                            return sprintf('%04d-%02d-%02d', $y, $m, min($d,$maxd));
+                        }
+                    }
+                    $fechas[] = _vp_add_months($base, $i);
+                } else {
+                    $step = $frec==='diaria' ? 1 : ($frec==='semanal' ? 7 : ($frec==='quincenal' ? 15 : $cada));
+                    $fechas[] = date('Y-m-d', strtotime($base." +".($i*$step)." days"));
+                }
+            }
+
             $dup = $db->prepare("SELECT COUNT(*) FROM citas WHERE mascota_id=? AND fecha=? AND tipo='control'");
-            $dup->execute([$data['mascota_id'], $fctrl]);
-            if ((int)$dup->fetchColumn() === 0) {
-                $db->prepare(
-                    "INSERT INTO citas (sede_id,mascota_id,veterinario_id,tipo,fecha,hora,duracion_minutos,estado,motivo)
-                     VALUES (?,?,?,'control',?,?,?, 'pendiente', ?)"
-                )->execute([
-                    $data['sede_id'],
-                    $data['mascota_id'],
-                    $data['veterinario_id'],
-                    $fctrl,
-                    '09:00:00',   // hora por defecto; el vet puede reagendarla
-                    30,
-                    'Control de seguimiento (generado desde la consulta del '.date('d/m/Y').')'
+            $ins = $db->prepare(
+                "INSERT INTO citas (sede_id,mascota_id,veterinario_id,tipo,fecha,hora,duracion_minutos,estado,motivo,grupo_recurrencia,sesion_numero,total_sesiones)
+                 VALUES (?,?,?,'control',?,?,?, 'pendiente', ?,?,?,?)"
+            );
+            foreach ($fechas as $k => $fch) {
+                // Evitar duplicar si ya hay un control ese día para esta mascota
+                $dup->execute([$data['mascota_id'], $fch]);
+                if ((int)$dup->fetchColumn() !== 0) continue;
+                $motivo = $recur
+                    ? 'Control recurrente '.($k+1).'/'.$n.' (generado desde la consulta del '.date('d/m/Y').')'
+                    : 'Control de seguimiento (generado desde la consulta del '.date('d/m/Y').')';
+                $ins->execute([
+                    $data['sede_id'], $data['mascota_id'], $data['veterinario_id'],
+                    $fch, '09:00:00', 30, $motivo,
+                    $grupo, ($recur ? $k+1 : null), ($recur ? $n : null)
                 ]);
             }
         } catch(Exception $e) { /* si falla, no bloquea el guardado de la consulta */ }
     }
     if(!empty($_POST['med_nombre'][0])){
+      try {
         $st2=$db->prepare("INSERT INTO recetas (consulta_id,mascota_id,veterinario_id,fecha,indicaciones) VALUES (?,?,?,CURDATE(),?)");
         $st2->execute([$nueva_cid,$data['mascota_id'],$data['veterinario_id'],trim($_POST['indicaciones']??'')]);
         $rid=(int)$db->lastInsertId();
         $st3=$db->prepare("INSERT INTO receta_items (receta_id,medicamento,dosis,frecuencia,duracion,via) VALUES (?,?,?,?,?,?)");
         foreach($_POST['med_nombre'] as $i=>$med) if(trim($med)) $st3->execute([$rid,trim($med),trim($_POST['med_dosis'][$i]??''),trim($_POST['med_frecuencia'][$i]??''),trim($_POST['med_duracion'][$i]??''),trim($_POST['med_via'][$i]??'')]);
+      } catch(Exception $e) { /* la consulta ya se guardó; no bloquear por la receta */ }
     }
     // Subir archivos adjuntos
     if(!empty($_FILES['archivos']['name'][0])){
@@ -250,9 +323,31 @@ if ($action==='nueva'): ?>
       </div>
       <div class="form-row-3">
         <div class="form-group"><label class="form-label">F. Respiratoria (rpm)</label><input class="form-input" type="number" name="frecuencia_respiratoria" placeholder="Ej: 20"></div>
-        <div class="form-group"><label class="form-label">Próximo control</label><input class="form-input" type="date" name="proximo_control"></div>
-        <div></div>
+        <div class="form-group"><label class="form-label">Próximo control</label><input class="form-input" type="date" name="proximo_control" id="pc-fecha" onchange="pcPreview()"></div>
+        <div class="form-group"><label class="form-label" style="display:block">&nbsp;</label>
+          <label class="flex items-center gap-1" style="cursor:pointer;font-size:13px;height:38px">
+            <input type="checkbox" name="pc_recurrente" value="1" id="pc-recur" onchange="pcToggle()" style="width:auto;margin:0"> 🔁 Controles recurrentes
+          </label>
+        </div>
       </div>
+      <div class="form-row-3" id="pc-recur-box" style="display:none">
+        <div class="form-group"><label class="form-label">Frecuencia</label>
+          <select class="form-input" name="pc_frecuencia" id="pc-frec" onchange="pcToggleCada();pcPreview()">
+            <option value="diaria">Diaria</option>
+            <option value="semanal" selected>Semanal (cada 7 días)</option>
+            <option value="quincenal">Quincenal (cada 15 días)</option>
+            <option value="mensual">Mensual</option>
+            <option value="personalizado">Personalizado (cada N días)</option>
+          </select>
+        </div>
+        <div class="form-group" id="pc-cada-box" style="display:none"><label class="form-label">Cada cuántos días</label>
+          <input class="form-input" type="number" name="pc_cada_dias" id="pc-cada" min="1" value="3" onchange="pcPreview()">
+        </div>
+        <div class="form-group"><label class="form-label">N° de controles</label>
+          <input class="form-input" type="number" name="pc_total_sesiones" id="pc-n" min="2" max="52" value="4" onchange="pcPreview()">
+        </div>
+      </div>
+      <div id="pc-preview" class="text-xs text-muted" style="margin:-4px 2px 4px"></div>
     </div>
 
     <!-- Clínica -->
@@ -349,6 +444,35 @@ if ($action==='nueva'): ?>
 
 <script>
 let medIdx=1;
+// ── Controles recurrentes (Próximo control) ──
+function pcToggle(){
+  var on = document.getElementById('pc-recur').checked;
+  document.getElementById('pc-recur-box').style.display = on ? '' : 'none';
+  pcPreview();
+}
+function pcToggleCada(){
+  document.getElementById('pc-cada-box').style.display =
+    document.getElementById('pc-frec').value === 'personalizado' ? '' : 'none';
+}
+function pcPreview(){
+  var box = document.getElementById('pc-preview'); if(!box) return;
+  var chk = document.getElementById('pc-recur');
+  var f = (document.getElementById('pc-fecha')||{}).value || '';
+  if(!chk || !chk.checked){ box.textContent=''; return; }
+  if(!f){ box.textContent='Indica la fecha del 1er control arriba.'; return; }
+  var n = Math.max(2, Math.min(52, parseInt(document.getElementById('pc-n').value||'0')));
+  var frec = document.getElementById('pc-frec').value;
+  var cada = Math.max(1, parseInt(document.getElementById('pc-cada').value||'1'));
+  var d0 = new Date(f+'T00:00:00'), fechas=[];
+  for(var i=0;i<n;i++){
+    var d = new Date(d0);
+    if(frec==='mensual'){ var _m=d0.getMonth()+i, _y=d0.getFullYear()+Math.floor(_m/12); _m=((_m%12)+12)%12; var _maxd=new Date(_y,_m+1,0).getDate(); d=new Date(_y,_m,Math.min(d0.getDate(),_maxd)); }
+    else { var step = frec==='diaria'?1:(frec==='semanal'?7:(frec==='quincenal'?15:cada)); d.setDate(d.getDate()+i*step); }
+    fechas.push(d);
+  }
+  var fmt = function(x){ return ('0'+x.getDate()).slice(-2)+'/'+('0'+(x.getMonth()+1)).slice(-2)+'/'+x.getFullYear(); };
+  box.innerHTML = '📅 <strong>'+n+' controles</strong> a las 09:00 · de '+fmt(fechas[0])+' a '+fmt(fechas[n-1])+'<br>'+fechas.slice(0,4).map(fmt).join(' · ')+(n>4?' …':'');
+}
 function addMed(){
   const d=document.createElement('div');d.className='med-row';d.innerHTML=`
     <input class="form-input" type="text" name="med_nombre[]" placeholder="Medicamento">
@@ -732,6 +856,12 @@ if ($mascota_id) {
   .hc-nueva-header { flex-direction:column !important; gap:8px; }
 }
 </style>
+
+<?php if(($_GET['msg']??'')==='err'): ?>
+  <div class="alert alert-danger" style="margin-bottom:12px"><span class="alert-icon">⚠️</span>
+    <?= clean($_GET['e'] ?? 'No se pudo guardar la consulta.') ?>
+  </div>
+<?php endif; ?>
 
 <?php if($msg==='ok'||($_GET['msg']??'')==='ok'): ?>
 <div class="alert alert-success mb-2"><span class="alert-icon">✅</span>Consulta registrada correctamente.</div>

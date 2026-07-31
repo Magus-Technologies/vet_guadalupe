@@ -273,7 +273,7 @@ body {
 <div class="left-panel">
     <!-- Imagen de fondo usando Unsplash (veterinaria) -->
     <img class="left-bg"
-         src="https://images.unsplash.com/photo-1576201836106-db1758fd1c97?w=900&q=80"
+         src="https://magus-ecommerce.com/vet_guadalupe/public/img/banner.jpg"
          alt="Veterinaria"
          onerror="this.style.display='none'">
     <div class="left-content">

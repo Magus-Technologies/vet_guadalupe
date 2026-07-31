@@ -230,9 +230,13 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
 <div class="page db-wrap">
 
 <!-- ══ KPI ROW ══ -->
+<style>
+.kpi-link{text-decoration:none;color:inherit;cursor:pointer;transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease}
+.kpi-link:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg,0 10px 30px rgba(0,0,0,.10));border-color:var(--primary)}
+</style>
 <div class="kpi-grid">
   <!-- Citas hoy -->
-  <div class="kpi-card">
+  <a href="?p=citas" class="kpi-card kpi-link" title="Ir a Citas / Agenda">
     <div class="kpi-icon blue">📅</div>
     <div class="flex-1">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
@@ -242,9 +246,9 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
       <div class="kpi-label">Citas de hoy</div>
       <div class="kpi-sub kpi-neutral">⏳ <?= $citas_pend ?> pendientes</div>
     </div>
-  </div>
+  </a>
   <!-- Pacientes mes -->
-  <div class="kpi-card">
+  <a href="?p=historial" class="kpi-card kpi-link" title="Ir a Historia Clínica / atenciones">
     <div class="kpi-icon green">🐾</div>
     <div class="flex-1">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
@@ -256,9 +260,9 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
         <?= $delta_pac>=0?'↑':'↓' ?> <?= abs($delta_pac) ?>% este mes
       </div>
     </div>
-  </div>
+  </a>
   <!-- Ingresos -->
-  <div class="kpi-card">
+  <a href="?p=caja" class="kpi-card kpi-link" title="Ir a Caja">
     <div class="kpi-icon orange">💰</div>
     <div class="flex-1">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
@@ -268,9 +272,9 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
       <div class="kpi-label">Ingresos del día</div>
       <div class="kpi-sub kpi-neutral">Meta mes: S/ <?= number_format($ingresos_mes,0) ?></div>
     </div>
-  </div>
+  </a>
   <!-- Nuevos clientes -->
-  <div class="kpi-card">
+  <a href="?p=clientes" class="kpi-card kpi-link" title="Ir a Clientes">
     <div class="kpi-icon purple">👥</div>
     <div class="flex-1">
       <div class="kpi-val"><?= $nuevos_clientes ?></div>
@@ -279,9 +283,9 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
         <?= $delta_cli>=0?'↑':'↓' ?> <?= abs($delta_cli) ?>% vs mes anterior
       </div>
     </div>
-  </div>
+  </a>
   <!-- Alertas -->
-  <div class="kpi-card" style="<?= $alertas_count>0?'border-color:#fca5a5':'' ?>">
+  <a href="?p=inventario" class="kpi-card kpi-link" title="Ir a Inventario (stock crítico)" style="<?= $alertas_count>0?'border-color:#fca5a5':'' ?>">
     <div class="kpi-icon red">⚠️</div>
     <div class="flex-1">
       <div class="kpi-val" style="<?= $alertas_count>0?'color:var(--danger)':'' ?>"><?= $alertas_count ?></div>
@@ -290,7 +294,7 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
         <?= $alertas_count>0?'Requieren atención':'Todo en orden ✅' ?>
       </div>
     </div>
-  </div>
+  </a>
 </div>
 
 <!-- ══ FILA PRINCIPAL ══ -->

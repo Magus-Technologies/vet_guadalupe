@@ -3,6 +3,34 @@ $page = 'citas'; $pageTitle = 'Citas';
 require_once __DIR__ . '/../includes/header.php';
 $db = getDB();
 
+// ════════════════════════════════════════════════════════════════
+// Visitas recurrentes — columnas de agrupación (idempotente)
+// grupo_recurrencia: UUID compartido por todas las sesiones de una serie
+// sesion_numero / total_sesiones: posición dentro de la serie (1..N)
+// ════════════════════════════════════════════════════════════════
+try {
+    $_c = $db->query("SHOW COLUMNS FROM `citas` LIKE 'grupo_recurrencia'")->fetchAll();
+    if (empty($_c)) {
+        $db->exec("ALTER TABLE `citas`
+            ADD COLUMN `grupo_recurrencia` VARCHAR(36) NULL,
+            ADD COLUMN `sesion_numero` SMALLINT NULL,
+            ADD COLUMN `total_sesiones` SMALLINT NULL");
+        $db->exec("CREATE INDEX idx_citas_grupo ON `citas` (`grupo_recurrencia`)");
+    }
+} catch (Exception $e) { /* si ya existen, no pasa nada */ }
+
+// Suma $i meses a una fecha conservando el día, recortado al último día
+// del mes destino (ej: 31-ene +1 mes = 28-feb, no 03-mar).
+if (!function_exists('_vp_add_months')) {
+    function _vp_add_months($base, $i) {
+        $ts = strtotime($base);
+        $y=(int)date('Y',$ts); $m=(int)date('n',$ts); $d=(int)date('j',$ts);
+        $m += $i; $y += intdiv($m-1,12); $m = (($m-1)%12)+1;
+        $maxd = (int)date('t', strtotime(sprintf('%04d-%02d-01',$y,$m)));
+        return sprintf('%04d-%02d-%02d', $y, $m, min($d,$maxd));
+    }
+}
+
 $action = $_GET['action'] ?? 'list';
 $msg = '';
 
@@ -13,18 +41,65 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $data = []; foreach ($fields as $f) $data[$f] = trim($_POST[$f] ?? '');
         $data['sede_id'] = getSede();
         $es_nueva = !$id;
+
+        // ── ¿Visita recurrente? Solo aplica al crear (no al editar) ──
+        $recurrente = $es_nueva && !empty($_POST['recurrente']);
         if ($id) {
+            // UPDATE de una cita existente (igual que antes)
             $sets = implode(',', array_map(fn($f)=>"$f=:$f", $fields));
             $st = $db->prepare("UPDATE citas SET $sets WHERE id=:id"); $data['id'] = $id;
+            $st->execute($data);
+        } elseif ($recurrente) {
+            // ── Crear toda la serie de citas de golpe ──
+            $frecuencia = $_POST['frecuencia'] ?? 'semanal';
+            $cada_dias  = max(1, (int)($_POST['cada_dias'] ?? 1));
+            $n_sesiones = max(2, min(52, (int)($_POST['total_sesiones'] ?? 0))); // tope de seguridad: 52
+            // UUID v4 para agrupar la serie
+            $b = random_bytes(16);
+            $b[6] = chr((ord($b[6]) & 0x0f) | 0x40);
+            $b[8] = chr((ord($b[8]) & 0x3f) | 0x80);
+            $grupo = vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($b), 4));
+            // Calcular las fechas de cada sesión a partir de la fecha base (sesión 1)
+            $base = $data['fecha'];
+            $fechas = [];
+            for ($i = 0; $i < $n_sesiones; $i++) {
+                if ($frecuencia === 'mensual') {
+                    $fechas[] = _vp_add_months($base, $i);
+                } else {
+                    $step = $frecuencia==='diaria' ? 1 : ($frecuencia==='semanal' ? 7 : ($frecuencia==='quincenal' ? 15 : $cada_dias));
+                    $fechas[] = date('Y-m-d', strtotime($base." +".($i*$step)." days"));
+                }
+            }
+            $ins = $db->prepare("INSERT INTO citas
+                (sede_id,mascota_id,veterinario_id,tipo,fecha,hora,duracion_minutos,estado,motivo,notas,grupo_recurrencia,sesion_numero,total_sesiones)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)");
+            $db->beginTransaction();
+            try {
+                foreach ($fechas as $k => $fch) {
+                    $ins->execute([
+                        $data['sede_id'], $data['mascota_id'], $data['veterinario_id'], $data['tipo'],
+                        $fch, $data['hora'], ($data['duracion_minutos']?:30), 'pendiente',
+                        $data['motivo'], $data['notas'], $grupo, $k+1, $n_sesiones
+                    ]);
+                    if ($k === 0) $id = (int)$db->lastInsertId();
+                }
+                $db->commit();
+            } catch (Exception $e) {
+                $db->rollBack();
+                throw $e;
+            }
+            // Para el hook de WhatsApp de abajo, la sesión 1 usa la fecha base (ya está en $data['fecha'])
         } else {
+            // INSERT de una sola cita (igual que antes)
             $cols = implode(',', array_merge($fields,['sede_id']));
             $pls  = implode(',', array_map(fn($f)=>":$f", array_merge($fields,['sede_id'])));
             $st = $db->prepare("INSERT INTO citas ($cols) VALUES ($pls)");
+            $st->execute($data);
+            $id = (int)$db->lastInsertId();
         }
-        $st->execute($data);
-        if ($es_nueva) $id = (int)$db->lastInsertId();
 
         // ── WhatsApp: confirmación automática al agendar una cita NUEVA ──
+        // En series recurrentes se envía SOLO la sesión 1 (no se satura al cliente).
         if ($es_nueva) {
             $wa_log = function($txt){ @file_put_contents(__DIR__.'/../wa_debug.log', date('Y-m-d H:i:s')." | $txt\n", FILE_APPEND); };
             try {
@@ -56,7 +131,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             }
         }
 
-        $msg = 'success'; $action = 'list';
+        $msg = ($recurrente ? 'serie:'.$n_sesiones : 'success'); $action = 'list';
     }
     if ($_POST['action'] === 'cambiar_estado') {
         $db->prepare("UPDATE citas SET estado=? WHERE id=?")->execute([$_POST['estado'], (int)$_POST['id']]);
@@ -104,6 +179,14 @@ try {
     }
 } catch(Exception $e) {}
 
+
+// Origen de la cita: distinguir reservas web de las agendadas en clínica
+try {
+    $_o = $db->query("SHOW COLUMNS FROM `citas` LIKE 'origen'")->fetchAll();
+    if (empty($_o)) $db->exec("ALTER TABLE `citas` ADD COLUMN origen ENUM('interno','web') NOT NULL DEFAULT 'interno'");
+} catch (Exception $e) {}
+
+
 // En modo día se ordena solo por hora; en los demás, por fecha y luego hora
 $order = ($modo === 'dia') ? "c.hora ASC" : "c.fecha ASC, c.hora ASC";
 $st = $db->prepare("SELECT c.*,m.nombre as mascota,m.especie,u.nombre as veterinario,cl.nombre as dueno,cl.telefono FROM citas c JOIN mascotas m ON m.id=c.mascota_id JOIN usuarios u ON u.id=c.veterinario_id JOIN clientes cl ON cl.id=m.cliente_id WHERE $where ORDER BY $order");
@@ -118,7 +201,7 @@ $tipo_labels   = ['consulta'=>'Consulta','vacuna'=>'Vacuna','control'=>'Control'
 $tipo_badge    = ['consulta'=>'b-teal','vacuna'=>'b-blue','cirugia'=>'b-red','bano'=>'b-amber','control'=>'b-purple','grooming'=>'b-green','emergencia'=>'b-red','hospitalizacion'=>'b-purple'];
 $estado_badge  = ['pendiente'=>'b-gray','confirmada'=>'b-blue','atendida'=>'b-teal','cancelada'=>'b-red','no_asistio'=>'b-amber'];
 ?>
-<?php if($msg==='success'): ?><div class="alert alert-success mb-2">✅ Cita guardada correctamente.</div><?php endif; ?>
+<?php if($msg==='success'): ?><div class="alert alert-success mb-2">✅ Cita guardada correctamente.</div><?php elseif(strpos($msg,'serie:')===0): ?><div class="alert alert-success mb-2">✅ Serie creada: <strong><?= (int)substr($msg,6) ?> sesiones</strong> agendadas correctamente. 🔁</div><?php endif; ?>
 
 <?php if(in_array($action,['nueva','editar'])): ?>
 <?php
@@ -181,6 +264,35 @@ $_default_vet = $vets_sel[0] ?? null;
       </select></div><?php else: ?><input type="hidden" name="estado" value="pendiente"><?php endif; ?>
     <div class="form-group"><label class="form-label">Motivo / Síntomas</label><textarea class="form-input" name="motivo"><?= clean($editing['motivo']??'') ?></textarea></div>
     <div class="form-group"><label class="form-label">Notas internas</label><input class="form-input" name="notas" value="<?= clean($editing['notas']??'') ?>"></div>
+    <?php if(!$editing): ?>
+    <div class="form-group" style="border:1px dashed var(--border);border-radius:10px;padding:12px 14px;background:var(--bg2)">
+      <label class="flex items-center gap-1" style="cursor:pointer;font-weight:600;margin:0">
+        <input type="checkbox" name="recurrente" value="1" id="chk-recur" onchange="toggleRecur()" style="width:auto;margin:0">
+        🔁 Visita recurrente (crear varias sesiones)
+      </label>
+      <div id="recur-box" style="display:none;margin-top:12px">
+        <div class="form-row">
+          <div class="form-group"><label class="form-label">Frecuencia</label>
+            <select class="form-input" name="frecuencia" id="recur-frec" onchange="toggleCadaDias();previewRecur()">
+              <option value="diaria">Diaria</option>
+              <option value="semanal" selected>Semanal (cada 7 días)</option>
+              <option value="quincenal">Quincenal (cada 15 días)</option>
+              <option value="mensual">Mensual</option>
+              <option value="personalizado">Personalizado (cada N días)</option>
+            </select>
+          </div>
+          <div class="form-group" id="cada-dias-box" style="display:none"><label class="form-label">Cada cuántos días</label>
+            <input class="form-input" type="number" name="cada_dias" id="recur-cada" min="1" value="3" onchange="previewRecur()">
+          </div>
+          <div class="form-group"><label class="form-label">N° de sesiones</label>
+            <input class="form-input" type="number" name="total_sesiones" id="recur-n" min="2" max="52" value="4" onchange="previewRecur()">
+          </div>
+        </div>
+        <div id="recur-preview" class="text-xs text-muted" style="margin-top:2px"></div>
+        <div class="text-xs text-muted" style="margin-top:8px;line-height:1.5">ℹ️ La <strong>sesión 1</strong> usa la fecha y hora de arriba; las demás se calculan automáticamente con la misma hora, mascota y veterinario. No se ajustan por fines de semana ni feriados — puedes reagendar cualquier sesión después. El recordatorio de WhatsApp se envía solo para la sesión 1.</div>
+      </div>
+    </div>
+    <?php endif; ?>
     <div class="flex gap-1"><button type="submit" class="btn btn-primary">💾 Guardar cita</button><a href="?p=citas" class="btn">Cancelar</a></div>
   </form>
 </div>
@@ -190,7 +302,39 @@ var _VET_CITA = <?= json_encode(array_values($_vets_js)) ?>;
 document.addEventListener('DOMContentLoaded', function() {
     vetSearchSelect('inp-mas-cita','drop-mas-cita','hid-mas-cita', _MAS_CITA, 'label');
     vetSearchSelect('inp-vet-cita','drop-vet-cita','hid-vet-cita', _VET_CITA, 'label');
+    var fInp = document.querySelector('input[name=fecha]');
+    if (fInp) fInp.addEventListener('change', previewRecur);
 });
+function toggleRecur(){
+    var on = document.getElementById('chk-recur').checked;
+    document.getElementById('recur-box').style.display = on ? '' : 'none';
+    previewRecur();
+}
+function toggleCadaDias(){
+    document.getElementById('cada-dias-box').style.display =
+        document.getElementById('recur-frec').value === 'personalizado' ? '' : 'none';
+}
+function previewRecur(){
+    var box = document.getElementById('recur-preview'); if(!box) return;
+    var chk = document.getElementById('chk-recur');
+    if(!chk || !chk.checked){ box.textContent=''; return; }
+    var fInp = document.querySelector('input[name=fecha]');
+    var f = fInp ? fInp.value : '';
+    if(!f){ box.textContent='Selecciona la fecha de la 1ª sesión arriba.'; return; }
+    var n = Math.max(2, Math.min(52, parseInt(document.getElementById('recur-n').value||'0')));
+    var frec = document.getElementById('recur-frec').value;
+    var cada = Math.max(1, parseInt(document.getElementById('recur-cada').value||'1'));
+    var d0 = new Date(f+'T00:00:00'), fechas=[];
+    for(var i=0;i<n;i++){
+        var d = new Date(d0);
+        if(frec==='mensual'){ var _m=d0.getMonth()+i, _y=d0.getFullYear()+Math.floor(_m/12); _m=((_m%12)+12)%12; var _maxd=new Date(_y,_m+1,0).getDate(); d=new Date(_y,_m,Math.min(d0.getDate(),_maxd)); }
+        else { var step = frec==='diaria'?1:(frec==='semanal'?7:(frec==='quincenal'?15:cada)); d.setDate(d.getDate()+i*step); }
+        fechas.push(d);
+    }
+    var fmt = function(x){ return ('0'+x.getDate()).slice(-2)+'/'+('0'+(x.getMonth()+1)).slice(-2)+'/'+x.getFullYear(); };
+    var muestra = fechas.slice(0,4).map(fmt).join(' · ');
+    box.innerHTML = '📅 <strong>'+n+' sesiones</strong> · de '+fmt(fechas[0])+' a '+fmt(fechas[n-1])+'<br>'+muestra+(n>4?' …':'');
+}
 </script>
 
 <?php else: ?>
@@ -251,10 +395,19 @@ document.addEventListener('DOMContentLoaded', function() {
             <?php if($modo!=='dia'): ?><div class="text-xs text-muted" style="font-weight:600"><?= date('d/m/Y',strtotime($c['fecha'])) ?></div><?php endif; ?>
             <?= substr($c['hora'],0,5) ?>
           </td>
-          <td><div class="flex items-center gap-1"><span style="font-size:18px"><?= $especie_icons[$c['especie']]??'🐾' ?></span><div><div class="td-main"><?= clean($c['mascota']) ?></div><div class="text-xs text-muted"><?= $c['duracion_minutos'] ?>min</div></div></div></td>
+          <td><div class="flex items-center gap-1"><span style="font-size:18px"><?= $especie_icons[$c['especie']]??'🐾' ?></span><div><div class="td-main"><?= clean($c['mascota']) ?></div><div class="text-xs text-muted"><?= $c['duracion_minutos'] ?>min</div><?php if(!empty($c['sesion_numero'])): ?><div class="text-xs" style="color:#7c3aed;font-weight:600">🔁 Sesión <?= (int)$c['sesion_numero'] ?>/<?= (int)$c['total_sesiones'] ?></div><?php endif; ?></div></div></td>
           <td><div><?= clean($c['dueno']) ?></div><div class="text-xs text-muted"><?= clean($c['telefono']) ?></div></td>
-          <td><span class="badge <?= $tipo_badge[$c['tipo']]??'b-gray' ?>"><?= $tipo_labels[$c['tipo']]??$c['tipo'] ?></span></td>
-          <td class="text-muted"><?= clean($c['veterinario']) ?></td>
+
+<td>
+            <span class="badge <?= $tipo_badge[$c['tipo']]??'b-gray' ?>"><?= $tipo_labels[$c['tipo']]??$c['tipo'] ?></span>
+            <?php if(($c['origen']??'interno')==='web'): ?>
+              <span class="badge" style="background:#e0f2fe;color:#0369a1" title="Reservada por el cliente vía web">🌐 Web</span>
+            <?php else: ?>
+              <span class="badge" style="background:#f1f5f9;color:#64748b" title="Agendada en la clínica">🏥 Clínica</span>
+            <?php endif; ?>
+          </td>
+
+<td class="text-muted"><?= clean($c['veterinario']) ?></td>
           <td><select class="form-input" style="width:130px;padding:5px 8px;font-size:12px" onchange="cambiarEstado(<?= $c['id'] ?>,this.value)"><?php foreach(['pendiente','confirmada','atendida','cancelada','no_asistio'] as $e): ?><option value="<?= $e ?>" <?= $c['estado']===$e?'selected':'' ?>><?= ucfirst(str_replace('_',' ',$e)) ?></option><?php endforeach; ?></select></td>
           <td><div class="flex gap-1">
             <?php if($c['estado']!=='atendida'): ?><a href="?p=historial&action=nueva&cita_id=<?= $c['id'] ?>&mascota_id=<?= $c['mascota_id'] ?>" class="btn btn-xs btn-primary">Atender</a><?php endif; ?>

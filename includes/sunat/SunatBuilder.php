@@ -33,6 +33,38 @@ class SunatBuilder
         ];
     }
 
+    /**
+     * Payload de nota de crédito/débito para POST /generar/nota.
+     *
+     * @param array $nota       Fila de `notas_credito`.
+     * @param array $ventaOrig  Fila de `ventas` (el comprobante afectado).
+     * @param array $cliente    Fila de `clientes`.
+     * @param array $items      Filas de `venta_items` del comprobante afectado.
+     */
+    public static function buildNota(array $nota, array $ventaOrig, array $cliente, array $items): array
+    {
+        $tipoDocAfectado  = $ventaOrig['tipo_comprobante'] === 'factura' ? '01' : '03';
+        $serieNumAfectado = $ventaOrig['serie'] . '-' . str_pad((string)$ventaOrig['numero'], 8, '0', STR_PAD_LEFT);
+        $aplica_igv       = !isset($ventaOrig['aplica_igv']) || (int)$ventaOrig['aplica_igv'] === 1;
+
+        return [
+            'endpoint'              => SUNAT_ENDPOINT,
+            'documento'             => $nota['tipo_nota'],
+            'empresa'               => self::empresa(),
+            'cliente'               => self::cliente($cliente, $ventaOrig['tipo_comprobante']),
+            'serie'                 => $nota['serie'],
+            'numero'                => (string) $nota['numero'],
+            'fecha_emision'         => date('Y-m-d H:i:s'),
+            'moneda'                => 'PEN',
+            'serie_numero_afectado' => $serieNumAfectado,
+            'cod_motivo'            => $nota['cod_motivo'],
+            'des_motivo'            => $nota['des_motivo'],
+            'doc_afectado'          => $ventaOrig['tipo_comprobante'],
+            'tipo_doc_afectado'     => $tipoDocAfectado,
+            'detalles'              => self::detalles($items, $aplica_igv),
+        ];
+    }
+
     /** Datos de la empresa emisora desde config_sunat.php */
     private static function empresa(): array
     {
@@ -53,7 +85,10 @@ class SunatBuilder
     /**
      * Resuelve el documento del cliente según tipo de comprobante y documento.
      * Factura: requiere RUC (tipo_doc=6).
-     * Boleta: DNI (1), Carné Extranjería (4), Pasaporte (7), o "varios" (0).
+     * Boleta: DNI (1), Carné Extranjería (4), Pasaporte (7), RUC de persona
+     * natural (6, RUC que no empieza en 20), o "varios" (0). Un RUC 20
+     * (persona jurídica) exige factura según el Reglamento de Comprobantes
+     * de Pago, por lo que se rechaza en boleta.
      */
     private static function cliente(array $cli, string $tipo): array
     {
@@ -100,6 +135,20 @@ class SunatBuilder
             return [
                 'tipo_doc'    => '7',
                 'num_doc'     => $pasaporte,
+                'rzn_social'  => $nom,
+                'direccion'   => $dir,
+            ];
+        }
+
+        // Cliente identificado solo con RUC: se permite en boleta si es
+        // persona natural (RUC 10/15/16/17). RUC 20 → debe emitirse factura.
+        if ($ruc !== '' && strlen($ruc) === 11) {
+            if (substr($ruc, 0, 2) === '20') {
+                throw new RuntimeException("El cliente '$nom' tiene RUC 20 (persona jurídica). A una empresa le corresponde factura, no boleta.");
+            }
+            return [
+                'tipo_doc'    => '6',
+                'num_doc'     => $ruc,
                 'rzn_social'  => $nom,
                 'direccion'   => $dir,
             ];

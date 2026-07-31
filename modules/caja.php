@@ -107,6 +107,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && in_array(($_POST['ajax'] ?? ''), ['
 
 require_once __DIR__ . '/../includes/header.php';
 $db = getDB();
+
+// ════════════════════════════════════════════════════════════════
+// Anulación de caja — migración idempotente
+//  - Agrega el estado 'anulada' al enum
+//  - Registra quién, cuándo y por qué se anuló
+// ════════════════════════════════════════════════════════════════
+try {
+    $colE = $db->query("SHOW COLUMNS FROM cajas LIKE 'estado'")->fetch();
+    if ($colE && stripos($colE['Type'], 'anulada') === false) {
+        $db->exec("ALTER TABLE cajas MODIFY COLUMN estado ENUM('abierta','cerrada','anulada') DEFAULT 'abierta'");
+    }
+    $colA = $db->query("SHOW COLUMNS FROM cajas LIKE 'anulada_por'")->fetchAll();
+    if (empty($colA)) {
+        $db->exec("ALTER TABLE cajas
+            ADD COLUMN motivo_anulacion VARCHAR(255) NULL,
+            ADD COLUMN anulada_por INT NULL,
+            ADD COLUMN fecha_anulacion DATETIME NULL");
+    }
+} catch (Exception $e) { /* ya aplicado */ }
+
 $action = $_GET['action'] ?? 'list';
 $msg = '';
 
@@ -124,6 +144,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $caja_id = (int)$_POST['caja_id'];
         $db->prepare("INSERT INTO movimientos_caja (caja_id,usuario_id,tipo,concepto,monto,metodo_pago,categoria) VALUES (?,?,?,?,?,?,?)")->execute([$caja_id,$user['id'],$_POST['tipo'],trim($_POST['concepto']),(float)$_POST['monto'],$_POST['metodo_pago'],$_POST['categoria']]);
         $msg='success'; $action='list';
+    }
+    if ($pa === 'anular') {
+        $caja_id = (int)($_POST['caja_id'] ?? 0);
+        $motivo  = trim($_POST['motivo'] ?? '');
+        if (!canDelete('caja')) {                      // solo admin o rol con permiso de eliminar
+            $msg = 'anular_denegado';
+        } elseif ($motivo === '') {                    // motivo obligatorio
+            $msg = 'anular_motivo';
+        } else {
+            // No permitir anular una caja con movimientos (están ligados a ventas)
+            $n = (int)$db->query("SELECT COUNT(*) FROM movimientos_caja WHERE caja_id={$caja_id}")->fetchColumn();
+            $estActual = $db->prepare("SELECT estado FROM cajas WHERE id=?");
+            $estActual->execute([$caja_id]); $est = $estActual->fetchColumn();
+            if ($est === false) {
+                $msg = 'anular_inexistente';
+            } elseif ($est === 'anulada') {
+                $msg = 'anular_ya';
+            } elseif ($n > 0) {
+                $msg = 'anular_con_mov';
+            } else {
+                $db->prepare("UPDATE cajas SET estado='anulada', motivo_anulacion=?, anulada_por=?, fecha_anulacion=NOW() WHERE id=? AND estado IN ('abierta','cerrada')")
+                   ->execute([substr($motivo,0,255), $user['id'], $caja_id]);
+                auditLog('anular', 'caja', "Caja #{$caja_id} anulada. Motivo: {$motivo}");
+                $msg = 'anulada'; $action = 'list';
+            }
+        }
     }
 }
 
@@ -149,13 +195,29 @@ if ($caja) {
 }
 
 // Historial de cajas
-$historial_cajas = $db->query("SELECT ca.*,u.nombre as cajero, (SELECT COALESCE(SUM(monto),0) FROM movimientos_caja WHERE caja_id=ca.id AND tipo='ingreso') as total_ingresos, (SELECT COALESCE(SUM(monto),0) FROM movimientos_caja WHERE caja_id=ca.id AND tipo='egreso') as total_egresos FROM cajas ca JOIN usuarios u ON u.id=ca.usuario_id WHERE 1=1$_caja_sw ORDER BY ca.id DESC LIMIT 15")->fetchAll();
+$historial_cajas = $db->query("SELECT ca.*,u.nombre as cajero, (SELECT COALESCE(SUM(monto),0) FROM movimientos_caja WHERE caja_id=ca.id AND tipo='ingreso') as total_ingresos, (SELECT COALESCE(SUM(monto),0) FROM movimientos_caja WHERE caja_id=ca.id AND tipo='egreso') as total_egresos, (SELECT COUNT(*) FROM movimientos_caja WHERE caja_id=ca.id) as n_mov FROM cajas ca JOIN usuarios u ON u.id=ca.usuario_id WHERE 1=1$_caja_sw ORDER BY ca.id DESC LIMIT 15")->fetchAll();
 $max_ingreso = max(array_column($historial_cajas,'total_ingresos') ?: [1]);
 
 $metodo_icons = ['efectivo'=>'💵','yape'=>'📱','plin'=>'📱','tarjeta_debito'=>'💳','tarjeta_credito'=>'💳','transferencia'=>'🏦'];
 $cat_labels = ['servicio'=>'Servicio','producto'=>'Producto','gasto_administrativo'=>'Gasto Admin.','compra_insumos'=>'Compra Insumos','otro'=>'Otro'];
 ?>
-<?php if($msg): ?><div class="alert alert-success mb-2">✅ Operación realizada correctamente.</div><?php endif; ?>
+<?php
+$_alerts = [
+    'anulada'           => ['ok',  '✅ Caja anulada correctamente.'],
+    'anular_denegado'   => ['err', '🚫 No tienes permiso para anular cajas.'],
+    'anular_motivo'     => ['err', '⚠️ Debes indicar el motivo de la anulación.'],
+    'anular_con_mov'    => ['err', '⛔ No se puede anular una caja con movimientos registrados. Reviértelos primero (están ligados a ventas).'],
+    'anular_ya'         => ['err', 'ℹ️ Esa caja ya estaba anulada.'],
+    'anular_inexistente'=> ['err', '⚠️ La caja indicada no existe.'],
+];
+if ($msg):
+    if (isset($_alerts[$msg])):
+        [$tipo,$txt] = $_alerts[$msg]; ?>
+        <div class="alert <?= $tipo==='ok'?'alert-success':'alert-danger' ?> mb-2"><?= $txt ?></div>
+    <?php else: ?>
+        <div class="alert alert-success mb-2">✅ Operación realizada correctamente.</div>
+    <?php endif;
+endif; ?>
 
 <?php if(!$caja): ?>
 <div class="card" style="max-width:480px;text-align:center;padding:40px">
@@ -268,7 +330,7 @@ $cat_labels = ['servicio'=>'Servicio','producto'=>'Producto','gasto_administrati
       <thead><tr><th>Apertura</th><th>Cierre</th><th>Cajero</th><th>Apertura (S/.)</th><th>Ingresos</th><th>Egresos</th><th>Balance</th><th>Estado</th><th></th></tr></thead>
       <tbody>
         <?php foreach($historial_cajas as $h): ?>
-        <tr onclick="verCaja(<?= (int)$h['id'] ?>)" style="cursor:pointer" class="caja-row">
+        <tr onclick="verCaja(<?= (int)$h['id'] ?>)" style="cursor:pointer<?= $h['estado']==='anulada'?';opacity:.6':'' ?>" class="caja-row">
           <td class="text-muted"><?= date('d/m/Y H:i',strtotime($h['fecha_apertura'])) ?></td>
           <td class="text-muted"><?= $h['fecha_cierre'] ? date('d/m/Y H:i',strtotime($h['fecha_cierre'])) : '—' ?></td>
           <td><?= clean($h['cajero']) ?></td>
@@ -276,8 +338,13 @@ $cat_labels = ['servicio'=>'Servicio','producto'=>'Producto','gasto_administrati
           <td class="font-med" style="color:var(--green)">S/. <?= number_format($h['total_ingresos'],2) ?></td>
           <td class="font-med" style="color:var(--red)">S/. <?= number_format($h['total_egresos'],2) ?></td>
           <td class="font-bold">S/. <?= number_format($h['monto_apertura']+$h['total_ingresos']-$h['total_egresos'],2) ?></td>
-          <td><span class="badge <?= $h['estado']==='abierta'?'b-teal':'b-gray' ?>"><?= ucfirst($h['estado']) ?></span></td>
-          <td style="text-align:right;color:var(--text3)">👁️ ver</td>
+          <td><?php if($h['estado']==='anulada'): ?><span class="badge" style="background:#fee2e2;color:#b91c1c">Anulada</span><?php else: ?><span class="badge <?= $h['estado']==='abierta'?'b-teal':'b-gray' ?>"><?= ucfirst($h['estado']) ?></span><?php endif; ?></td>
+          <td style="text-align:right;color:var(--text3);white-space:nowrap">
+            <?php if(canDelete('caja') && $h['estado']!=='anulada'): ?>
+              <button onclick="event.stopPropagation();anularCaja(<?= (int)$h['id'] ?>,<?= (int)$h['n_mov'] ?>)" title="Anular caja" style="border:1px solid #fecaca;background:#fff5f5;color:#b91c1c;border-radius:6px;padding:3px 8px;cursor:pointer;font-size:11px;margin-right:6px">🚫 anular</button>
+            <?php endif; ?>
+            👁️ ver
+          </td>
         </tr>
         <?php endforeach; ?>
       </tbody>
@@ -312,8 +379,43 @@ $cat_labels = ['servicio'=>'Servicio','producto'=>'Producto','gasto_administrati
   </div>
 </div>
 
+<!-- MODAL: Anular caja -->
+<div id="anular-modal" class="modal-overlay" style="display:none;z-index:1200">
+  <div class="modal" style="max-width:440px">
+    <div class="modal-header">
+      <div class="modal-title">🚫 Anular caja</div>
+      <button class="modal-close" onclick="document.getElementById('anular-modal').style.display='none'">✕</button>
+    </div>
+    <form method="post">
+      <div class="modal-body">
+        <input type="hidden" name="action" value="anular">
+        <input type="hidden" name="caja_id" id="anular-caja-id">
+        <div class="alert alert-danger mb-2" style="font-size:13px">Esta acción marca la caja #<span id="anular-caja-num"></span> como <strong>anulada</strong> y queda registrada en auditoría. No se puede deshacer.</div>
+        <label class="form-label">Motivo de la anulación <span style="color:var(--red)">*</span></label>
+        <textarea class="form-input" name="motivo" id="anular-motivo" rows="3" required placeholder="Ej: caja abierta por error"></textarea>
+      </div>
+      <div class="modal-footer flex gap-1" style="padding:0 16px 16px;justify-content:flex-end">
+        <button type="button" class="btn" onclick="document.getElementById('anular-modal').style.display='none'">Cancelar</button>
+        <button type="submit" class="btn" style="background:#b91c1c;color:#fff">Anular caja</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script>
 function _waMoney(s){ return 'S/ ' + s; }
+
+// ── Anular caja ──
+function anularCaja(id, nMov){
+  if (nMov > 0){
+    alert('No se puede anular esta caja: tiene ' + nMov + ' movimiento(s) registrado(s).\n\nLos movimientos están ligados a ventas. Reviértelos primero si necesitas anularla.');
+    return;
+  }
+  document.getElementById('anular-caja-id').value = id;
+  document.getElementById('anular-caja-num').textContent = id;
+  document.getElementById('anular-motivo').value = '';
+  document.getElementById('anular-modal').style.display = 'flex';
+}
 
 // ── Ver movimientos de una caja ──
 function verCaja(id){

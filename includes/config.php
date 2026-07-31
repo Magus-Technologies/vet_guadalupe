@@ -26,10 +26,10 @@ if ($__isLocal) {
 } else {
     // ════════ PRODUCCIÓN ════════
     define('DB_HOST', 'localhost');
-    define('DB_NAME', 'vetpro');
+    define('DB_NAME', 'vet_guadalupe');
     define('DB_USER', 'root');
     define('DB_PASS', 'c4p1cu4$$');
-    define('BASE_URL', 'https://magus-ecommerce.com/vetpro');
+    define('BASE_URL', 'https://magus-ecommerce.com/vet_guadalupe');
     define('APP_ENV',  'production');
     define('MIGRATIONS_TOKEN', 'CAMBIAR_POR_TOKEN_LARGO_Y_ALEATORIO');
 }
@@ -92,12 +92,19 @@ function hasRole($roles) {
 
 // ── Permisos granulares ───────────────────────────────────────
 function loadPermisos() {
-    if (isset($_SESSION['permisos'])) return $_SESSION['permisos'];
-    $user = getUser();
+  //  if (isset($_SESSION['permisos'])) return $_SESSION['permisos'];
+	
+static $cache = null;
+    if ($cache !== null) return $cache;
+
+
+	$user = getUser();
     if (!$user) return [];
     if ($user['rol'] === 'admin') {
-        $_SESSION['permisos'] = ['__admin__' => true];
-        return $_SESSION['permisos'];
+    
+    $cache = ['__admin__' => true];
+        return $cache;
+    
     }
     try {
         $db = getDB();
@@ -113,8 +120,10 @@ function loadPermisos() {
                 'exportar' => (bool)$p['puede_exportar'],
             ];
         }
-        $_SESSION['permisos'] = $permisos;
-        return $permisos;
+    
+    $cache = $permisos;
+        return $cache;
+    
     } catch(Exception $e) { return []; }
 }
 
@@ -237,3 +246,72 @@ function siguienteNumeroSerie(PDO $db, string $serie): int {
         return 1;
     }
 }
+
+/**
+ * Registra el egreso que compensa la anulación de una venta.
+ *
+ * `movimientos_caja` no guarda estado y caja.php suma sus filas en crudo, así
+ * que anular una venta no descuenta nada por sí solo. En vez de borrar el
+ * ingreso original —lo que reescribiría el arqueo de una caja ya cerrada—
+ * se asienta un egreso por el mismo importe en la caja ABIERTA: la devolución
+ * impacta el día en que ocurre, que es como se lleva un libro de caja.
+ *
+ * Se apoya en los ingresos realmente asentados (no en `ventas.total`) para que
+ * un pago mixto o un cobro parcial se devuelvan por su monto y método reales.
+ *
+ * @return int Cantidad de egresos asentados (0 si no hay caja abierta o ya se compensó).
+ */
+function registrarEgresoAnulacion(PDO $db, int $ventaId, int $usuarioId, string $motivo = 'Anulación'): int {
+    try {
+        $caja = $db->query("SELECT id FROM cajas WHERE estado='abierta' ORDER BY id DESC LIMIT 1")->fetchColumn();
+        if (!$caja) return 0;
+
+        // Ingresos ya asentados por esta venta.
+        $st = $db->prepare("
+            SELECT metodo_pago, SUM(monto) AS monto
+            FROM movimientos_caja
+            WHERE venta_id=? AND tipo='ingreso'
+            GROUP BY metodo_pago
+        ");
+        $st->execute([$ventaId]);
+        $ingresos = $st->fetchAll();
+        if (!$ingresos) return 0;
+
+        // Egresos ya compensados antes (evita duplicar si se reintenta).
+        $st = $db->prepare("
+            SELECT metodo_pago, SUM(monto) AS monto
+            FROM movimientos_caja
+            WHERE venta_id=? AND tipo='egreso'
+            GROUP BY metodo_pago
+        ");
+        $st->execute([$ventaId]);
+        $yaDevuelto = [];
+        foreach ($st->fetchAll() as $r) $yaDevuelto[$r['metodo_pago']] = (float)$r['monto'];
+
+        $st = $db->prepare("SELECT serie, numero FROM ventas WHERE id=?");
+        $st->execute([$ventaId]);
+        $v = $st->fetch();
+        $ref = $v ? $v['serie'] . '-' . str_pad((string)$v['numero'], 8, '0', STR_PAD_LEFT) : "venta #$ventaId";
+
+        $ins = $db->prepare("
+            INSERT INTO movimientos_caja (caja_id,usuario_id,tipo,concepto,monto,metodo_pago,categoria,venta_id)
+            VALUES (?,?,'egreso',?,?,?,'otro',?)
+        ");
+
+        $n = 0;
+        foreach ($ingresos as $g) {
+            $pendiente = (float)$g['monto'] - ($yaDevuelto[$g['metodo_pago']] ?? 0);
+            if ($pendiente <= 0) continue;
+            $ins->execute([$caja, $usuarioId, "$motivo $ref", $pendiente, $g['metodo_pago'], $ventaId]);
+            $n++;
+        }
+        return $n;
+    } catch (Exception $e) {
+        return 0;
+    }
+}
+
+
+
+
+
