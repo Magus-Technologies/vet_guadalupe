@@ -248,6 +248,41 @@ function siguienteNumeroSerie(PDO $db, string $serie): int {
 }
 
 /**
+ * Arma un mensaje de error útil a partir de una respuesta de SunatService.
+ *
+ * SunatService cae en un texto genérico ("Error al generar XML.", "HTTP: Bad
+ * Request") cuando la respuesta no trae la clave `mensaje`. El motivo real
+ * queda en `detalle` —el cuerpo completo que devolvió la API— y sin esto se
+ * perdía, dejando al usuario con un error que no dice nada.
+ */
+function explicarErrorSunat(array $r): string {
+    $base = trim((string)($r['mensaje'] ?? '')) ?: 'Error desconocido.';
+    $d    = $r['detalle'] ?? null;
+    if (!is_array($d)) return $base;
+
+    $partes = [];
+
+    // Validación estilo Laravel: {"message": "...", "errors": {"campo": ["..."]}}
+    if (!empty($d['errors']) && is_array($d['errors'])) {
+        foreach ($d['errors'] as $campo => $msgs) {
+            $partes[] = $campo . ': ' . (is_array($msgs) ? implode(' / ', $msgs) : (string)$msgs);
+        }
+    }
+    foreach (['message', 'error', 'detalle', 'descripcion', 'mensaje_sunat', 'codigo'] as $k) {
+        if (!empty($d[$k]) && is_scalar($d[$k])) { $partes[] = $k . ': ' . $d[$k]; }
+    }
+
+    // Último recurso: el cuerpo crudo, recortado.
+    if (!$partes) {
+        $crudo = $d['raw'] ?? json_encode($d, JSON_UNESCAPED_UNICODE);
+        $partes[] = mb_substr((string)$crudo, 0, 400);
+    }
+
+    $http = isset($d['http']) ? ' [HTTP ' . $d['http'] . ']' : '';
+    return $base . $http . ' → ' . implode(' | ', $partes);
+}
+
+/**
  * Registra el egreso que compensa la anulación de una venta.
  *
  * `movimientos_caja` no guarda estado y caja.php suma sus filas en crudo, así

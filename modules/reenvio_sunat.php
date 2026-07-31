@@ -96,41 +96,6 @@ function limpiarRastroSunat(PDO $db, int $ventaId): void {
 }
 
 /**
- * Arma un mensaje de error útil a partir de la respuesta de la API.
- *
- * SunatService cae en un texto genérico ("Error al generar XML.") cuando la
- * respuesta no trae la clave `mensaje` — típico de una validación de Laravel,
- * que responde `message` + `errors` en inglés. El motivo real queda en
- * `detalle`, así que se rescata de ahí.
- */
-function explicarError(array $r): string {
-    $base = trim((string)($r['mensaje'] ?? '')) ?: 'Error desconocido.';
-    $d    = $r['detalle'] ?? null;
-    if (!is_array($d)) return $base;
-
-    $partes = [];
-
-    // Validación estilo Laravel: {"message": "...", "errors": {"campo": ["..."]}}
-    if (!empty($d['errors']) && is_array($d['errors'])) {
-        foreach ($d['errors'] as $campo => $msgs) {
-            $partes[] = $campo . ': ' . (is_array($msgs) ? implode(' / ', $msgs) : (string)$msgs);
-        }
-    }
-    foreach (['message', 'error', 'detalle', 'descripcion'] as $k) {
-        if (!empty($d[$k]) && is_scalar($d[$k])) { $partes[] = (string)$d[$k]; break; }
-    }
-
-    // Último recurso: el cuerpo crudo, recortado.
-    if (!$partes) {
-        $crudo = $d['raw'] ?? json_encode($d, JSON_UNESCAPED_UNICODE);
-        $partes[] = mb_substr((string)$crudo, 0, 300);
-    }
-
-    $http = isset($d['http']) ? ' [HTTP ' . $d['http'] . ']' : '';
-    return $base . $http . ' → ' . implode(' | ', $partes);
-}
-
-/**
  * Procesa UN comprobante y devuelve el resultado.
  *
  * Las dos etapas van separadas a propósito: 'regenerar' arma y firma el XML sin
@@ -154,7 +119,7 @@ function procesarUno(PDO $db, SunatService $svc, string $accion, int $ventaId): 
         limpiarRastroSunat($db, $ventaId);
         $r = $svc->generarXml($ventaId);
         return ['ok' => $r['ok'], 'ref' => $ref,
-                'msg' => $r['ok'] ? 'XML regenerado y firmado.' : explicarError($r)];
+                'msg' => $r['ok'] ? 'XML regenerado y firmado.' : explicarErrorSunat($r)];
     }
 
     if (empty($v['sunat_xml'])) {
@@ -162,7 +127,7 @@ function procesarUno(PDO $db, SunatService $svc, string $accion, int $ventaId): 
                 'msg' => 'OMITIDO: no tiene XML. Regeneralo primero.'];
     }
     $r = $svc->enviarSunat($ventaId);
-    return ['ok' => $r['ok'], 'ref' => $ref, 'msg' => $r['ok'] ? $r['mensaje'] : explicarError($r)];
+    return ['ok' => $r['ok'], 'ref' => $ref, 'msg' => $r['ok'] ? $r['mensaje'] : explicarErrorSunat($r)];
 }
 
 /*

@@ -183,7 +183,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         if (!$resul['ok']) {
                             // XML falló — rollback total, no se registra nada
                             $db->rollBack();
-                            $_SESSION['flash_error'] = 'SUNAT_ERROR: ' . $resul['mensaje'];
+                            $_SESSION['flash_error'] = 'SUNAT_ERROR: ' . explicarErrorSunat($resul);
                             header('Location: '.BASE_URL.'/index.php?p=facturacion&action=nueva&msg=sunat_fail');
                             exit;
                         }
@@ -258,8 +258,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             require_once $sunat_svc;
             $sunat = new SunatService($db);
             $resul = $sunat->enviarSunat($vid);
+            // En el fallo se muestra el detalle completo de la API: el mensaje
+            // pelado ("HTTP: Bad Request") no alcanza para saber qué pasó.
             $qs    = '&sunat=' . ($resul['ok'] ? 'env_ok' : 'env_err')
-                   . '&sunat_msg=' . urlencode($resul['mensaje']);
+                   . '&sunat_msg=' . urlencode($resul['ok'] ? $resul['mensaje'] : explicarErrorSunat($resul));
         } else {
             $qs = '&sunat=xml_err&sunat_msg=' . urlencode('Módulo SUNAT no instalado.');
         }
