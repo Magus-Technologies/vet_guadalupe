@@ -169,6 +169,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $st2->execute([$venta_id, $it['tipo'], $it['ref'], $it['desc'], $it['qty'], $it['precio'], $it['sub']]);
                 }
 
+                // ── Descuento de stock + kardex (dentro de la transacción) ──
+                // Solo aplica a ítems de farmacia ('producto') o pet shop ('petshop')
+                // que referencien un producto real. Servicios e ítems manuales no tocan stock.
+                // Kardex solo se escribe para farmacia: la FK `kardex.producto_id` apunta a
+                // `productos.id`, así que escribir ids de petshop fallaría o corrompería la auditoría.
+                $refVenta = "$serie-" . str_pad($numero, 5, '0', STR_PAD_LEFT);
+                $stKardex = $db->prepare("INSERT INTO kardex (producto_id,usuario_id,tipo,cantidad,stock_anterior,stock_nuevo,referencia,notas,origen,sede_id) VALUES (?,?, 'venta',?,?,?,?,?,?,?)");
+                foreach ($items_ok as $it) {
+                    if ($it['ref'] <= 0) continue;
+                    $tabla = $it['tipo'] === 'petshop' ? 'petshop_productos' : ($it['tipo'] === 'producto' ? 'productos' : null);
+                    if (!$tabla) continue;
+
+                    $stP = $db->prepare("SELECT stock, nombre FROM $tabla WHERE id=?");
+                    $stP->execute([$it['ref']]);
+                    $prod = $stP->fetch();
+                    if (!$prod) continue; // producto dado de baja entre el render y el POST
+
+                    $stock_ant = (int)$prod['stock'];
+                    if ($it['qty'] > $stock_ant) {
+                        throw new Exception("Stock insuficiente de '{$prod['nombre']}' (disponible: {$stock_ant}, vendido: {$it['qty']}).");
+                    }
+                    $stock_nuevo = $stock_ant - $it['qty'];
+
+                    $db->prepare("UPDATE $tabla SET stock=? WHERE id=?")->execute([$stock_nuevo, $it['ref']]);
+                    if ($it['tipo'] === 'producto') {
+                        $stKardex->execute([
+                            $it['ref'], $user['id'], $it['qty'], $stock_ant, $stock_nuevo, $refVenta,
+                            $it['desc'], 'farmacia', getSede(),
+                        ]);
+                    }
+                }
+
                 // ── Generación de XML ANTES del commit ──
                 // Si falla SUNAT para factura/boleta, se hace ROLLBACK y no se crea la venta.
                 $sunat_xml_generado = null;
@@ -235,6 +267,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $db->prepare("UPDATE ventas SET estado='anulado' WHERE id=?")->execute([$anular_id]);
+        // Devolver al inventario el stock descontado por esta venta (kardex tipo 'venta' inverso)
+        $stItems = $db->prepare("SELECT tipo, referencia_id, cantidad, descripcion FROM venta_items WHERE venta_id=?");
+        $stItems->execute([$anular_id]);
+        $stKardex = $db->prepare("INSERT INTO kardex (producto_id,usuario_id,tipo,cantidad,stock_anterior,stock_nuevo,referencia,notas,origen,sede_id) VALUES (?,?, 'entrada',?,?,?,?,?,?,?)");
+        foreach ($stItems->fetchAll() as $iv) {
+            $ref_id = (int)$iv['referencia_id'];
+            if ($ref_id <= 0) continue;
+            $tabla = $iv['tipo'] === 'petshop' ? 'petshop_productos' : ($iv['tipo'] === 'producto' ? 'productos' : null);
+            if (!$tabla) continue;
+            $stP = $db->prepare("SELECT stock FROM $tabla WHERE id=?");
+            $stP->execute([$ref_id]);
+            $stock_ant = (int)$stP->fetchColumn();
+            $qty = (int)$iv['cantidad'];
+            $db->prepare("UPDATE $tabla SET stock=? WHERE id=?")->execute([$stock_ant + $qty, $ref_id]);
+            if ($iv['tipo'] === 'producto') {
+                $stKardex->execute([
+                    $ref_id, (int)$user['id'], $qty, $stock_ant, $stock_ant + $qty,
+                    'ANULACION-' . $anular_id, $iv['descripcion'] . ' (devolución por anulación)',
+                    'farmacia', getSede(),
+                ]);
+            }
+        }
         // Descuenta de la caja abierta lo que esta venta había ingresado.
         $tuvo_ingreso = (int)$db->query("SELECT COUNT(*) FROM movimientos_caja WHERE tipo='ingreso' AND venta_id=".$anular_id)->fetchColumn();
         $egresos = registrarEgresoAnulacion($db, $anular_id, (int)$user['id'], 'Anulación');
