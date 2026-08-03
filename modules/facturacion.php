@@ -731,16 +731,16 @@ if (isset($_SESSION['flash_error'])) {
           <label class="form-label mt-2">¿Aplica IGV?</label>
           <div class="igv-toggle">
             <label class="igv-opt">
-              <input type="radio" name="aplica_igv" value="1" checked onchange="toggleIgv()">
+              <input type="radio" name="aplica_igv" value="1" onchange="toggleIgv()">
               <span class="igv-pill"><span class="igv-ico">✓</span><span>Sí (gravado)</span></span>
             </label>
             <label class="igv-opt">
-              <input type="radio" name="aplica_igv" value="0" onchange="toggleIgv()">
+              <input type="radio" name="aplica_igv" value="0" checked onchange="toggleIgv()">
               <span class="igv-pill"><span class="igv-ico">○</span><span>No (exonerado)</span></span>
             </label>
           </div>
-          <div id="igv-info" class="mt-2" style="font-size:11.5px;padding:9px 12px;border-radius:8px;background:#e8f8f7;border:1px solid #b8e6e3;color:#0f6b65">
-            ℹ Los precios <strong>incluyen IGV (18%)</strong>. Se desglosa automáticamente en el comprobante.
+          <div id="igv-info" class="mt-2" style="font-size:11.5px;padding:9px 12px;border-radius:8px;background:#fef3c7;border:1px solid #fde68a;color:#92400e">
+            🧾 Los precios <strong>NO incluyen IGV</strong>. Se emite como comprobante exonerado/inafecto.
           </div>
           <style>
             .igv-toggle { display:grid;grid-template-columns:1fr 1fr;gap:6px }
