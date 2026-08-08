@@ -51,11 +51,20 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['action']??'')==='save_consul
     $user = function_exists('getUser') ? getUser() : ($GLOBALS['user'] ?? []);
     $cita_id = (int)($_GET['cita_id'] ?? 0);
     $fields=['mascota_id','veterinario_id','tipo','fecha','peso_actual','temperatura',
-             'frecuencia_cardiaca','frecuencia_respiratoria','sintomas','diagnostico',
+             'frecuencia_cardiaca','frecuencia_respiratoria',
+             'deshidratacion','mucosas','reflejo_tusigeno','linfonodos','palpacion_abdominal',
+             'sintomas','diagnostico',
              'tratamiento','observaciones','proximo_control'];
     $data=[]; foreach($fields as $f) $data[$f]=trim($_POST[$f]??'')?:null;
     $data['cita_id']=$cita_id?:null;
     $data['sede_id']=$user['sede_id']??1;
+    // ¿Es edición de una consulta existente?
+    $consulta_id_edit = (int)($_POST['consulta_id'] ?? 0);
+    $is_update = $consulta_id_edit > 0;
+    // Normalizar decimales (aceptar coma y varios decimales: "4,56" o "4.560")
+    foreach (['peso_actual','temperatura'] as $_dec) {
+        if (!empty($data[$_dec])) { $data[$_dec]=str_replace(',','.',$data[$_dec]); if(!is_numeric($data[$_dec])) $data[$_dec]=null; }
+    }
 
     // ── Normalizar datos para que no choquen con la BD ──
     // fecha: datetime-local manda "2026-07-17T10:30" -> "2026-07-17 10:30"
@@ -86,23 +95,108 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['action']??'')==='save_consul
     try { $r=$db->query("SHOW COLUMNS FROM consultas LIKE 'firma_veterinario'")->fetchAll(); if(empty($r)) $db->exec("ALTER TABLE consultas ADD COLUMN firma_veterinario MEDIUMTEXT"); } catch(Exception $e){}
     try { $r=$db->query("SHOW COLUMNS FROM consultas LIKE 'nota_voz_texto'")->fetchAll(); if(empty($r)) $db->exec("ALTER TABLE consultas ADD COLUMN nota_voz_texto TEXT"); } catch(Exception $e){}
     try { $r=$db->query("SHOW COLUMNS FROM consultas LIKE 'plantilla_usada'")->fetchAll(); if(empty($r)) $db->exec("ALTER TABLE consultas ADD COLUMN plantilla_usada VARCHAR(100)"); } catch(Exception $e){}
-    $cols=implode(',',array_merge($fields,['cita_id','sede_id']));
-    $pls=implode(',',array_map(fn($f)=>":$f",array_merge($fields,['cita_id','sede_id'])));
-    try {
-        $st=$db->prepare("INSERT INTO consultas ($cols$extra_cols) VALUES ($pls$extra_pls)");
-        $st->execute(array_merge($data,$extra_data));
-    } catch (Exception $e) {
-        // Nunca dejar pantalla en blanco: volver con el motivo exacto
-        header('Location: '.BASE_URL.'/index.php?p=historial&mascota_id='.$_mid.'&msg=err&e='.urlencode('No se pudo guardar la consulta: '.$e->getMessage()));
-        exit;
+    // Nuevos signos vitales (idempotente): %DH, mucosas, reflejo tusígeno, linfonodos, palpación abdominal
+    foreach ([
+        'deshidratacion'      => 'VARCHAR(30)',
+        'mucosas'             => 'VARCHAR(120)',
+        'reflejo_tusigeno'    => 'VARCHAR(60)',
+        'linfonodos'          => 'VARCHAR(150)',
+        'palpacion_abdominal' => 'VARCHAR(255)',
+    ] as $_col => $_type) {
+        try { $r=$db->query("SHOW COLUMNS FROM consultas LIKE '$_col'")->fetchAll(); if(empty($r)) $db->exec("ALTER TABLE consultas ADD COLUMN $_col $_type DEFAULT NULL"); } catch(Exception $e){}
     }
-    $nueva_cid=(int)$db->lastInsertId();
-    if($data['cita_id']) $db->prepare("UPDATE citas SET estado='atendida' WHERE id=?")->execute([$data['cita_id']]);
+    if ($is_update) {
+        // ── EDITAR consulta existente ──
+        // No se cambia cita_id ni sede en la edición; se actualizan los datos clínicos.
+        $upd_fields = ['tipo','fecha','peso_actual','temperatura','frecuencia_cardiaca',
+                       'frecuencia_respiratoria','deshidratacion','mucosas','reflejo_tusigeno',
+                       'linfonodos','palpacion_abdominal','sintomas','diagnostico','tratamiento',
+                       'observaciones','proximo_control'];
+        $set = implode(',', array_map(fn($f)=>"$f=:$f", $upd_fields));
+        $set_extra = '';
+        $upd_data = [];
+        foreach ($upd_fields as $f) $upd_data[$f] = $data[$f];
+        if ($firma)     { $set_extra.=',firma_veterinario=:firma_veterinario'; $upd_data['firma_veterinario']=$firma; }
+        if ($nota_voz)  { $set_extra.=',nota_voz_texto=:nota_voz_texto';       $upd_data['nota_voz_texto']=$nota_voz; }
+        if ($plantilla) { $set_extra.=',plantilla_usada=:plantilla_usada';     $upd_data['plantilla_usada']=$plantilla; }
+        $upd_data['id'] = $consulta_id_edit;
+        try {
+            $st=$db->prepare("UPDATE consultas SET $set$set_extra WHERE id=:id");
+            $st->execute($upd_data);
+        } catch (Exception $e) {
+            header('Location: '.BASE_URL.'/index.php?p=historial&mascota_id='.$_mid.'&msg=err&e='.urlencode('No se pudo actualizar la consulta: '.$e->getMessage()));
+            exit;
+        }
+        $nueva_cid = $consulta_id_edit;
+    } else {
+        $cols=implode(',',array_merge($fields,['cita_id','sede_id']));
+        $pls=implode(',',array_map(fn($f)=>":$f",array_merge($fields,['cita_id','sede_id'])));
+        try {
+            $st=$db->prepare("INSERT INTO consultas ($cols$extra_cols) VALUES ($pls$extra_pls)");
+            $st->execute(array_merge($data,$extra_data));
+        } catch (Exception $e) {
+            // Nunca dejar pantalla en blanco: volver con el motivo exacto
+            header('Location: '.BASE_URL.'/index.php?p=historial&mascota_id='.$_mid.'&msg=err&e='.urlencode('No se pudo guardar la consulta: '.$e->getMessage()));
+            exit;
+        }
+        $nueva_cid=(int)$db->lastInsertId();
+        if($data['cita_id']) $db->prepare("UPDATE citas SET estado='atendida' WHERE id=?")->execute([$data['cita_id']]);
+    }
+
+    // ── Enlazar con TRIAJE (si la consulta se creó desde "Atender") ──
+    $triaje_id_link = (int)($_POST['triaje_id'] ?? 0);
+    if ($triaje_id_link) {
+        try {
+            $tc = $db->query("SHOW COLUMNS FROM consultas LIKE 'triaje_id'")->fetchAll();
+            if (empty($tc)) $db->exec("ALTER TABLE consultas ADD COLUMN triaje_id INT DEFAULT NULL");
+            $db->prepare("UPDATE consultas SET triaje_id=? WHERE id=?")->execute([$triaje_id_link, $nueva_cid]);
+            $db->prepare("UPDATE triaje SET estado='atendido', consulta_id=? WHERE id=?")->execute([$nueva_cid, $triaje_id_link]);
+        } catch(Exception $e) { /* no bloquea el guardado */ }
+    }
+
+    // ── Sincronizar VACUNACIÓN ──
+    // TODA consulta de tipo "vacuna" genera (o actualiza) un registro en el
+    // módulo de Vacunación, enlazado por consulta_id. El nombre se toma del
+    // desplegable "Tipo de vacuna"; si se dejó vacío, se usa el diagnóstico o
+    // los síntomas escritos y, en último caso, "Vacuna".
+    $vac_tipo = trim($_POST['vac_tipo_vacuna'] ?? '');
+    if ($data['tipo']==='vacuna' && $vac_tipo==='') {
+        $vac_tipo = trim((string)($data['diagnostico'] ?? '')) ?: trim((string)($data['sintomas'] ?? '')) ?: 'Vacuna';
+        $vac_tipo = mb_substr($vac_tipo, 0, 100);
+    }
+    if ($data['tipo']==='vacuna' && $vac_tipo!=='') {
+        try {
+            // Asegurar columna de enlace
+            $vc = $db->query("SHOW COLUMNS FROM vacunas LIKE 'consulta_id'")->fetchAll();
+            if (empty($vc)) $db->exec("ALTER TABLE vacunas ADD COLUMN consulta_id INT DEFAULT NULL");
+            $vac = [
+                'tipo_vacuna'      => $vac_tipo,
+                'laboratorio'      => trim($_POST['vac_laboratorio'] ?? '') ?: null,
+                'lote'             => trim($_POST['vac_lote'] ?? '') ?: null,
+                'fecha_aplicacion' => (!empty($data['fecha']) ? substr($data['fecha'],0,10) : date('Y-m-d')),
+                'fecha_vencimiento'=> trim($_POST['vac_fecha_vencimiento'] ?? '') ?: null,
+                'proxima_dosis'    => trim($_POST['vac_proxima_dosis'] ?? '') ?: null,
+                'notas'            => trim($_POST['vac_notas'] ?? '') ?: null,
+            ];
+            // ¿Ya existe una vacuna enlazada a esta consulta? (evita duplicar al editar)
+            $ex = $db->prepare("SELECT id FROM vacunas WHERE consulta_id=? LIMIT 1");
+            $ex->execute([$nueva_cid]);
+            $ex_id = $ex->fetchColumn();
+            if ($ex_id) {
+                $db->prepare("UPDATE vacunas SET tipo_vacuna=?,laboratorio=?,lote=?,fecha_aplicacion=?,fecha_vencimiento=?,proxima_dosis=?,notas=? WHERE id=?")
+                   ->execute([$vac['tipo_vacuna'],$vac['laboratorio'],$vac['lote'],$vac['fecha_aplicacion'],$vac['fecha_vencimiento'],$vac['proxima_dosis'],$vac['notas'],(int)$ex_id]);
+            } else {
+                $db->prepare("INSERT INTO vacunas (mascota_id,veterinario_id,consulta_id,tipo_vacuna,laboratorio,lote,fecha_aplicacion,fecha_vencimiento,proxima_dosis,notas) VALUES (?,?,?,?,?,?,?,?,?,?)")
+                   ->execute([$data['mascota_id'],$data['veterinario_id'],$nueva_cid,$vac['tipo_vacuna'],$vac['laboratorio'],$vac['lote'],$vac['fecha_aplicacion'],$vac['fecha_vencimiento'],$vac['proxima_dosis'],$vac['notas']]);
+            }
+        } catch(Exception $e) { /* la consulta ya se guardó; no bloquear por la vacuna */ }
+    }
 
     // ── Próximo control → crear cita(s) automática(s) en la agenda ──
     // Por defecto crea UN control en la fecha indicada. Si el vet marcó
     // "Controles recurrentes", crea toda la serie agrupada.
-    if (!empty($data['proximo_control'])) {
+    // (Solo al crear la consulta; al editar no se regeneran citas.)
+    if (!$is_update && !empty($data['proximo_control'])) {
         try {
             // Asegurar columnas de recurrencia (idempotente)
             $_c = $db->query("SHOW COLUMNS FROM `citas` LIKE 'grupo_recurrencia'")->fetchAll();
@@ -170,7 +264,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['action']??'')==='save_consul
             }
         } catch(Exception $e) { /* si falla, no bloquea el guardado de la consulta */ }
     }
-    if(!empty($_POST['med_nombre'][0])){
+    if(!$is_update && !empty($_POST['med_nombre'][0])){
       try {
         $st2=$db->prepare("INSERT INTO recetas (consulta_id,mascota_id,veterinario_id,fecha,indicaciones) VALUES (?,?,?,CURDATE(),?)");
         $st2->execute([$nueva_cid,$data['mascota_id'],$data['veterinario_id'],trim($_POST['indicaciones']??'')]);
@@ -213,6 +307,14 @@ $cita_id     = (int)($_GET['cita_id']    ?? 0);
 $consulta_id = (int)($_GET['cid']        ?? 0);
 $msg = $_GET['msg'] ?? '';
 
+// Ampliar peso_actual para admitir 3 decimales (ej. 4.560) — una sola vez
+try {
+    $cpa = $db->query("SHOW COLUMNS FROM consultas LIKE 'peso_actual'")->fetch();
+    if ($cpa && stripos($cpa['Type'] ?? '', '(7,3)') === false) {
+        $db->exec("ALTER TABLE consultas MODIFY COLUMN peso_actual DECIMAL(7,3) DEFAULT NULL");
+    }
+} catch (Exception $e) {}
+
 $vets_sel=$db->query("SELECT id,nombre FROM usuarios WHERE rol IN ('veterinario','admin') AND activo=1")->fetchAll();
 $mascotas_sel=$db->query("SELECT m.id,CONCAT(m.nombre,' (',c.nombre,')') as label FROM mascotas m JOIN clientes c ON c.id=m.cliente_id WHERE m.estado='activo' ORDER BY m.nombre")->fetchAll();
 $ei=['perro'=>'🐕','gato'=>'🐈','conejo'=>'🐰','ave'=>'🐦','reptil'=>'🦎','roedor'=>'🐭','otro'=>'🐾'];
@@ -229,13 +331,44 @@ if ($action==='nueva'): ?>
 
 <div class="hc-form">
   <?php
+  // ── Modo edición: cargar consulta existente por ?cid= ──
+  $editing_c = null;
+  $edit_cid = (int)($_GET['cid'] ?? 0);
+  if ($edit_cid) {
+      $st=$db->prepare("SELECT * FROM consultas WHERE id=?"); $st->execute([$edit_cid]);
+      $editing_c=$st->fetch();
+      if ($editing_c) { $mascota_id = (int)$editing_c['mascota_id']; }
+  }
+  // Precarga desde Triaje (cuando se crea la consulta con "Atender")
+  $pf_sintomas = $editing_c ? '' : trim((string)($_GET['pf_sintomas'] ?? ''));
+  $pf_peso     = $editing_c ? '' : trim((string)($_GET['pf_peso'] ?? ''));
+  $pf_temp     = $editing_c ? '' : trim((string)($_GET['pf_temp'] ?? ''));
+  $triaje_id_pf = (int)($_GET['triaje_id'] ?? 0);
+  // Helpers de valor para precargar el formulario en edición
+  $cv  = function($k) use ($editing_c){ return $editing_c ? clean((string)($editing_c[$k]??'')) : ''; };
+  $csel= function($k,$opt) use ($editing_c){ return ($editing_c && (string)($editing_c[$k]??'')===$opt) ? 'selected' : ''; };
+  $vet_pre_id = $editing_c ? (int)$editing_c['veterinario_id'] : 0;
+  // Vacuna enlazada a esta consulta (si existe) para precargar la sección de vacunación
+  $vac_pre = null;
+  if ($editing_c) { try { $vp=$db->prepare("SELECT * FROM vacunas WHERE consulta_id=? LIMIT 1"); $vp->execute([$edit_cid]); $vac_pre=$vp->fetch(); } catch(Exception $e){} }
+  // Tipos de vacuna activos para el desplegable (crea/siembra la tabla si aún no existe)
+  $tipos_vac_hc = [];
+  try {
+      $db->exec("CREATE TABLE IF NOT EXISTS tipos_vacuna (id INT AUTO_INCREMENT PRIMARY KEY, nombre VARCHAR(100) NOT NULL, estado ENUM('activo','suspendido') NOT NULL DEFAULT 'activo', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+      if ((int)$db->query("SELECT COUNT(*) FROM tipos_vacuna")->fetchColumn() === 0) {
+          foreach (['Antirrábica','Óctuple','Séxtuple','Triple Felina','Leucemia Felina','Parvovirus','Mixomatosis','Enfermedad de Newcastle','Otra'] as $s)
+              $db->prepare("INSERT INTO tipos_vacuna (nombre) VALUES (?)")->execute([$s]);
+      }
+      $tipos_vac_hc = $db->query("SELECT nombre FROM tipos_vacuna WHERE estado='activo' ORDER BY nombre")->fetchAll(PDO::FETCH_COLUMN);
+  } catch(Exception $e){}
+
   $mascota_pre=null;
   if($mascota_id){$st=$db->prepare("SELECT m.*,c.nombre as dueno FROM mascotas m JOIN clientes c ON c.id=m.cliente_id WHERE m.id=?");$st->execute([$mascota_id]);$mascota_pre=$st->fetch();}
   if($cita_id&&!$mascota_pre){$st=$db->prepare("SELECT m.*,c.nombre as dueno FROM mascotas m JOIN clientes c ON c.id=m.cliente_id JOIN citas ci ON ci.mascota_id=m.id WHERE ci.id=?");$st->execute([$cita_id]);$mascota_pre=$st->fetch();if($mascota_pre)$mascota_id=$mascota_pre['id'];}
   ?>
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px">
     <div>
-      <div class="page-title">🩺 Nueva Consulta Médica</div>
+      <div class="page-title">🩺 <?= $editing_c ? 'Editar Consulta Médica' : 'Nueva Consulta Médica' ?></div>
       <?php if($mascota_pre): ?><div class="page-desc">Paciente: <strong><?= clean($mascota_pre['nombre']) ?></strong> · <?= clean($mascota_pre['dueno']) ?></div><?php endif; ?>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
@@ -271,6 +404,8 @@ if ($action==='nueva'): ?>
 
   <form method="POST" enctype="multipart/form-data">
     <input type="hidden" name="action" value="save_consulta">
+    <?php if($editing_c): ?><input type="hidden" name="consulta_id" value="<?= (int)$edit_cid ?>"><?php endif; ?>
+    <?php if($triaje_id_pf): ?><input type="hidden" name="triaje_id" value="<?= $triaje_id_pf ?>"><?php endif; ?>
     <input type="hidden" name="cita_id" value="<?= $cita_id ?>">
 
     <div class="card">
@@ -279,7 +414,8 @@ if ($action==='nueva'): ?>
       $_hc_mas_js  = array_map(fn($m)=>['id'=>$m['id'],'label'=>$m['label']], $mascotas_sel);
       $_hc_vet_js  = array_map(fn($v)=>['id'=>$v['id'],'label'=>$v['nombre']], $vets_sel);
       $_hc_mas_pre = $mascota_pre ? $mascotas_sel[array_search($mascota_id, array_column($mascotas_sel,'id'))] ?? null : null;
-      $_hc_vet_pre = array_filter($vets_sel, fn($v)=>$v['id']==$user['id']); $_hc_vet_pre = $_hc_vet_pre ? reset($_hc_vet_pre) : ($vets_sel[0]??null);
+      $_hc_vet_target = $vet_pre_id ?: ($user['id']??0); // en edición, el vet de la consulta
+      $_hc_vet_pre = array_filter($vets_sel, fn($v)=>$v['id']==$_hc_vet_target); $_hc_vet_pre = $_hc_vet_pre ? reset($_hc_vet_pre) : ($vets_sel[0]??null);
       ?>
       <div class="form-row">
         <div class="form-group" style="position:relative">
@@ -293,22 +429,22 @@ if ($action==='nueva'): ?>
         <div class="form-group" style="position:relative">
           <label class="form-label required">Veterinario</label>
           <input type="text" id="inp-vet-hc" class="form-input" placeholder="👨‍⚕️ Buscar veterinario..."
-                 value=""
+                 value="<?= ($editing_c && $_hc_vet_pre)?clean($_hc_vet_pre['nombre']):'' ?>"
                  autocomplete="off">
-          <input type="hidden" name="veterinario_id" id="hid-vet-hc" value="" required>
+          <input type="hidden" name="veterinario_id" id="hid-vet-hc" value="<?= $editing_c && $_hc_vet_pre?(int)$_hc_vet_pre['id']:'' ?>" required>
           <div id="drop-vet-hc" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg2);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.12);z-index:300;max-height:200px;overflow-y:auto"></div>
         </div>
       </div>
       <div class="form-row">
         <div class="form-group"><label class="form-label">Tipo de consulta</label>
-          <select class="form-input" name="tipo">
-            <option value="consulta">Consulta general</option><option value="control">Control</option>
-            <option value="emergencia">Emergencia</option><option value="cirugia">Post-cirugía</option>
-            <option value="vacuna">Vacunación</option><option value="hospitalizacion">Hospitalización</option>
+          <select class="form-input" name="tipo" id="hc-tipo" onchange="hcToggleVacuna()">
+            <option value="consulta" <?= $csel('tipo','consulta') ?>>Consulta general</option><option value="control" <?= $csel('tipo','control') ?>>Control</option>
+            <option value="emergencia" <?= $csel('tipo','emergencia') ?>>Emergencia</option><option value="cirugia" <?= $csel('tipo','cirugia') ?>>Post-cirugía</option>
+            <option value="vacuna" <?= $csel('tipo','vacuna') ?>>Vacunación</option><option value="hospitalizacion" <?= $csel('tipo','hospitalizacion') ?>>Hospitalización</option>
           </select>
         </div>
         <div class="form-group"><label class="form-label">Fecha y hora</label>
-          <input class="form-input" type="datetime-local" name="fecha" value="<?= date('Y-m-d\TH:i') ?>">
+          <input class="form-input" type="datetime-local" name="fecha" value="<?= $editing_c ? date('Y-m-d\TH:i', strtotime($editing_c['fecha'])) : date('Y-m-d\TH:i') ?>">
         </div>
       </div>
     </div>
@@ -317,18 +453,28 @@ if ($action==='nueva'): ?>
     <div class="card">
       <div class="sec-box-title">📊 Signos vitales</div>
       <div class="form-row-3">
-        <div class="form-group"><label class="form-label">Peso actual (kg)</label><input class="form-input" type="number" step="0.1" name="peso_actual" placeholder="Ej: 10.5"></div>
-        <div class="form-group"><label class="form-label">Temperatura (°C)</label><input class="form-input" type="number" step="0.1" name="temperatura" placeholder="Ej: 38.5"></div>
-        <div class="form-group"><label class="form-label">F. Cardíaca (rpm)</label><input class="form-input" type="number" name="frecuencia_cardiaca" placeholder="Ej: 80"></div>
+        <div class="form-group"><label class="form-label">Peso actual (kg)</label><input class="form-input" type="number" step="0.001" min="0" name="peso_actual" value="<?= $editing_c?$cv('peso_actual'):clean($pf_peso) ?>" placeholder="Ej: 4.560"></div>
+        <div class="form-group"><label class="form-label">Temperatura (°C)</label><input class="form-input" type="number" step="0.1" name="temperatura" value="<?= $editing_c?$cv('temperatura'):clean($pf_temp) ?>" placeholder="Ej: 38.5"></div>
+        <div class="form-group"><label class="form-label">F. Cardíaca (rpm)</label><input class="form-input" type="number" name="frecuencia_cardiaca" value="<?= $cv('frecuencia_cardiaca') ?>" placeholder="Ej: 80"></div>
       </div>
       <div class="form-row-3">
-        <div class="form-group"><label class="form-label">F. Respiratoria (rpm)</label><input class="form-input" type="number" name="frecuencia_respiratoria" placeholder="Ej: 20"></div>
-        <div class="form-group"><label class="form-label">Próximo control</label><input class="form-input" type="date" name="proximo_control" id="pc-fecha" onchange="pcPreview()"></div>
+        <div class="form-group"><label class="form-label">F. Respiratoria (rpm)</label><input class="form-input" type="number" name="frecuencia_respiratoria" value="<?= $cv('frecuencia_respiratoria') ?>" placeholder="Ej: 20"></div>
+        <div class="form-group"><label class="form-label">% Deshidratación</label><input class="form-input" name="deshidratacion" value="<?= $cv('deshidratacion') ?>" placeholder="Ej: 5%"></div>
+        <div class="form-group"><label class="form-label">Mucosas</label><input class="form-input" name="mucosas" value="<?= $cv('mucosas') ?>" placeholder="Ej: rosadas, húmedas"></div>
+      </div>
+      <div class="form-row-3">
+        <div class="form-group"><label class="form-label">Reflejo Tusígeno</label><input class="form-input" name="reflejo_tusigeno" value="<?= $cv('reflejo_tusigeno') ?>" placeholder="Ej: negativo"></div>
+        <div class="form-group"><label class="form-label">Linfonodos</label><input class="form-input" name="linfonodos" value="<?= $cv('linfonodos') ?>" placeholder="Ej: no reactivos"></div>
+        <div class="form-group"><label class="form-label">Palpación Abdominal</label><input class="form-input" name="palpacion_abdominal" value="<?= $cv('palpacion_abdominal') ?>" placeholder="Ej: sin dolor, blando"></div>
+      </div>
+      <div class="form-row-3">
+        <div class="form-group"><label class="form-label">Próximo control</label><input class="form-input" type="date" name="proximo_control" id="pc-fecha" value="<?= $cv('proximo_control') ?>" onchange="pcPreview()"></div>
         <div class="form-group"><label class="form-label" style="display:block">&nbsp;</label>
           <label class="flex items-center gap-1" style="cursor:pointer;font-size:13px;height:38px">
             <input type="checkbox" name="pc_recurrente" value="1" id="pc-recur" onchange="pcToggle()" style="width:auto;margin:0"> 🔁 Controles recurrentes
           </label>
         </div>
+        <div class="form-group"></div>
       </div>
       <div class="form-row-3" id="pc-recur-box" style="display:none">
         <div class="form-group"><label class="form-label">Frecuencia</label>
@@ -353,18 +499,48 @@ if ($action==='nueva'): ?>
     <!-- Clínica -->
     <div class="card">
       <div class="sec-box-title">🔬 Datos clínicos</div>
-      <div class="form-group"><label class="form-label required">Síntomas / Motivo de consulta</label>
-        <textarea class="form-input" name="sintomas" style="min-height:70px" required placeholder="Describe los síntomas presentados..."></textarea>
+      <div class="form-group"><label class="form-label">Síntomas / Motivo de consulta</label>
+        <textarea class="form-input" name="sintomas" style="min-height:70px" placeholder="Describe los síntomas presentados..."><?= $editing_c?$cv('sintomas'):clean($pf_sintomas) ?></textarea>
       </div>
-      <div class="form-group"><label class="form-label required">Diagnóstico</label>
-        <textarea class="form-input" name="diagnostico" style="min-height:70px" required placeholder="Diagnóstico clínico..."></textarea>
+      <div class="form-group"><label class="form-label">Diagnóstico</label>
+        <textarea class="form-input" name="diagnostico" style="min-height:70px" placeholder="Diagnóstico clínico..."><?= $cv('diagnostico') ?></textarea>
       </div>
       <div class="form-group"><label class="form-label">Tratamiento indicado</label>
-        <textarea class="form-input" name="tratamiento" style="min-height:70px" placeholder="Tratamiento, procedimientos, indicaciones..."></textarea>
+        <textarea class="form-input" name="tratamiento" style="min-height:70px" placeholder="Tratamiento, procedimientos, indicaciones..."><?= $cv('tratamiento') ?></textarea>
       </div>
       <div class="form-group"><label class="form-label">Notas del veterinario</label>
-        <textarea class="form-input" name="observaciones" style="min-height:55px" placeholder="Observaciones adicionales..."></textarea>
+        <textarea class="form-input" name="observaciones" style="min-height:55px" placeholder="Observaciones adicionales..."><?= $cv('observaciones') ?></textarea>
       </div>
+    </div>
+
+    <!-- 💉 Vacunación (aparece cuando el tipo es "Vacunación") -->
+    <div class="card" id="hc-vacuna-box" style="display:none">
+      <div class="sec-box-title">💉 Datos de vacunación <span style="font-size:10px;font-weight:400;color:var(--text3)">(se registra también en el módulo Vacunación)</span></div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">Tipo de vacuna</label>
+          <select class="form-input" name="vac_tipo_vacuna">
+            <option value="">— Seleccionar —</option>
+            <?php foreach($tipos_vac_hc as $tv): ?>
+              <option value="<?= clean($tv) ?>" <?= ($vac_pre && $vac_pre['tipo_vacuna']===$tv)?'selected':'' ?>><?= clean($tv) ?></option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+        <div class="form-group"><label class="form-label">Laboratorio</label>
+          <input class="form-input" name="vac_laboratorio" value="<?= $vac_pre?clean($vac_pre['laboratorio']??''):'' ?>" placeholder="Ej: Zoetis, Nobivac"></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">N° de lote</label>
+          <input class="form-input" name="vac_lote" value="<?= $vac_pre?clean($vac_pre['lote']??''):'' ?>" placeholder="Ej: L2025-01"></div>
+        <div class="form-group"><label class="form-label">Próxima dosis</label>
+          <input class="form-input" type="date" name="vac_proxima_dosis" value="<?= $vac_pre?clean($vac_pre['proxima_dosis']??''):'' ?>"></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label">Vencimiento (vacuna)</label>
+          <input class="form-input" type="date" name="vac_fecha_vencimiento" value="<?= $vac_pre?clean($vac_pre['fecha_vencimiento']??''):'' ?>"></div>
+        <div class="form-group"><label class="form-label">Notas de la vacuna</label>
+          <input class="form-input" name="vac_notas" value="<?= $vac_pre?clean($vac_pre['notas']??''):'' ?>" placeholder="Opcional"></div>
+      </div>
+      <div style="font-size:11px;color:var(--text3)">💡 Elige el tipo de vacuna para que quede registrada en el módulo <strong>Vacunación</strong>. Si lo dejas vacío, solo se guarda como consulta.</div>
     </div>
 
     <!-- Receta -->
@@ -599,7 +775,15 @@ var _HC_VET = <?= json_encode(array_values($_hc_vet_js??[])) ?>;
 document.addEventListener('DOMContentLoaded', function() {
     vetSearchSelect('inp-mas-hc','drop-mas-hc','hid-mas-hc', _HC_MAS, 'label');
     vetSearchSelect('inp-vet-hc','drop-vet-hc','hid-vet-hc', _HC_VET, 'label');
+    hcToggleVacuna();
 });
+// Mostrar la sección de vacunación solo cuando el tipo es "Vacunación"
+function hcToggleVacuna(){
+    var sel=document.getElementById('hc-tipo');
+    var box=document.getElementById('hc-vacuna-box');
+    if(!sel||!box) return;
+    box.style.display = (sel.value==='vacuna') ? 'block' : 'none';
+}
 </script>
 
 <?php
@@ -631,6 +815,16 @@ $consultas=$db->prepare("SELECT con.*,m.nombre as mascota,m.especie,m.foto,u.nom
     FROM consultas con JOIN mascotas m ON m.id=con.mascota_id JOIN usuarios u ON u.id=con.veterinario_id
     JOIN clientes cl ON cl.id=m.cliente_id WHERE $where ORDER BY con.fecha DESC LIMIT 60");
 $consultas->execute($params); $consultas=$consultas->fetchAll();
+// ── Vacunas de la mascota (para la pestaña "Vacunas" del historial) ──
+// Muestra TODAS las vacunas registradas de la mascota, sin importar si se
+// crearon desde el módulo Vacunación o desde una consulta.
+$vacunas_hc = [];
+if ($mascota_id) {
+    try {
+        $vq=$db->prepare("SELECT v.*,u.nombre as veterinario FROM vacunas v LEFT JOIN usuarios u ON u.id=v.veterinario_id WHERE v.mascota_id=? ORDER BY v.fecha_aplicacion DESC, v.id DESC");
+        $vq->execute([$mascota_id]); $vacunas_hc=$vq->fetchAll();
+    } catch(Exception $e){ $vacunas_hc=[]; }
+}
 // Consulta seleccionada para el panel de detalle
 $consulta_sel=null; $receta_sel=[]; $archivos_sel=[];
 $sel_id = $consulta_id ?: (($consultas[0]['id']??0));
@@ -1013,7 +1207,41 @@ $espcol_pac=['perro'=>'#10b981','gato'=>'#6366f1','conejo'=>'#f59e0b','ave'=>'#3
 
     <!-- Timeline -->
     <div class="hc-timeline">
-      <?php if(empty($consultas)): ?>
+      <?php if($tab_act==='vacunas'): ?>
+        <?php if(empty($vacunas_hc)): ?>
+        <div class="hc-empty-small"><div style="font-size:32px;margin-bottom:8px;opacity:.3">💉</div><div style="font-size:12px">Sin vacunas registradas</div>
+          <?php if($mascota_id): ?><a href="?p=vacunas&action=nueva" class="btn btn-primary btn-xs" style="margin-top:10px">+ Registrar vacuna</a><?php endif; ?>
+        </div>
+        <?php else:
+          $mes_abr=['01'=>'ENE','02'=>'FEB','03'=>'MAR','04'=>'ABR','05'=>'MAY','06'=>'JUN','07'=>'JUL','08'=>'AGO','09'=>'SEP','10'=>'OCT','11'=>'NOV','12'=>'DIC'];
+          foreach($vacunas_hc as $vh):
+            $fap=strtotime($vh['fecha_aplicacion']);
+            $prox = !empty($vh['proxima_dosis']) ? strtotime($vh['proxima_dosis']) : null;
+            $estv = $vh['estado']??'aplicada';
+            if($estv==='anulada'){$vb='background:#f1f5f9;color:#64748b';$vt='Anulada';}
+            elseif($estv==='completada'){$vb='background:#dcfce7;color:#15803d';$vt='Completada';}
+            elseif($prox && $prox<time()){$vb='background:#fee2e2;color:#b91c1c';$vt='Vencida';}
+            elseif($prox && $prox<=time()+7*86400){$vb='background:#fef3c7;color:#b45309';$vt='Por vencer';}
+            else{$vb='background:#ccfbf1;color:#0f766e';$vt='Vigente';}
+        ?>
+        <div class="hc-item" style="cursor:default">
+          <div class="hc-dot" style="background:#0ea5a4"></div>
+          <div class="hc-fecha-col">
+            <div class="hc-dia"><?= date('d',$fap) ?></div>
+            <div class="hc-mes"><?= $mes_abr[date('m',$fap)]??date('M',$fap) ?></div>
+            <div class="hc-anio"><?= date('Y',$fap) ?></div>
+          </div>
+          <div class="hc-item-body">
+            <div class="hc-item-tipo">💉 <?= clean($vh['tipo_vacuna']) ?> <span class="badge" style="<?= $vb ?>;font-size:9px;padding:1px 7px;border-radius:999px;margin-left:4px"><?= $vt ?></span></div>
+            <div class="hc-item-diag"><?= $vh['proxima_dosis']?'Próxima dosis: '.date('d/m/Y',$prox):($vh['laboratorio']?clean($vh['laboratorio']):'—') ?></div>
+            <div class="hc-item-vet"><?= $vh['veterinario']?'Dr/a. '.clean($vh['veterinario']):'' ?><?= $vh['lote']?' · Lote '.clean($vh['lote']):'' ?></div>
+          </div>
+        </div>
+        <?php endforeach; endif; ?>
+        <div style="text-align:center;padding:12px">
+          <a href="?p=vacunas<?= $mascota_id?'&mascota_id='.$mascota_id:'' ?>" style="font-size:11px;color:var(--primary);font-weight:600;text-decoration:none">Ir al módulo Vacunación →</a>
+        </div>
+      <?php elseif(empty($consultas)): ?>
       <div class="hc-empty-small"><div style="font-size:32px;margin-bottom:8px;opacity:.3">📋</div><div style="font-size:12px">Sin registros encontrados</div>
         <?php if($mascota_id): ?><a href="?p=historial&action=nueva&mascota_id=<?= $mascota_id ?>" class="btn btn-primary btn-xs" style="margin-top:10px">+ Nueva atención</a><?php endif; ?>
       </div>
@@ -1065,8 +1293,11 @@ $espcol_pac=['perro'=>'#10b981','gato'=>'#6366f1','conejo'=>'#f59e0b','ave'=>'#3
             <?php if(!empty($receta_sel)): ?>&nbsp;<span style="background:#d1fae5;color:#065f46;font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px">Con receta</span><?php endif; ?>
           </div>
         </div>
-        <?php $tbl=$tipo_badge[$consulta_sel['tipo']]??['b','#f1f5f9','#475569']; ?>
-        <span style="background:<?= $tbl[1] ?>;color:<?= $tbl[2] ?>;font-size:11px;font-weight:700;padding:4px 12px;border-radius:999px;flex-shrink:0;white-space:nowrap"><?= $tipo_labels[$consulta_sel['tipo']]??ucfirst($consulta_sel['tipo']) ?></span>
+        <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+          <a href="?p=historial&action=nueva&cid=<?= (int)$consulta_sel['id'] ?>" class="btn btn-ghost btn-sm" style="border-color:var(--primary);color:var(--primary)" title="Editar esta consulta">✏️ Editar</a>
+          <?php $tbl=$tipo_badge[$consulta_sel['tipo']]??['b','#f1f5f9','#475569']; ?>
+          <span style="background:<?= $tbl[1] ?>;color:<?= $tbl[2] ?>;font-size:11px;font-weight:700;padding:4px 12px;border-radius:999px;white-space:nowrap"><?= $tipo_labels[$consulta_sel['tipo']]??ucfirst($consulta_sel['tipo']) ?></span>
+        </div>
       </div>
     </div>
 
@@ -1107,6 +1338,26 @@ $espcol_pac=['perro'=>'#10b981','gato'=>'#6366f1','conejo'=>'#f59e0b','ave'=>'#3
         <div class="vital-status" style="background:<?= $frst[1] ?>;color:<?= $frst[2] ?>"><?= $frst[0] ?></div>
       </div>
       <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Otros signos / examen físico -->
+    <?php
+    $_ex = array_filter([
+      '💧 % Deshidratación'    => $consulta_sel['deshidratacion']??'',
+      '👄 Mucosas'             => $consulta_sel['mucosas']??'',
+      '😮‍💨 Reflejo tusígeno'  => $consulta_sel['reflejo_tusigeno']??'',
+      '🔗 Linfonodos'          => $consulta_sel['linfonodos']??'',
+      '✋ Palpación abdominal'  => $consulta_sel['palpacion_abdominal']??'',
+    ], fn($v)=>trim((string)$v)!=='');
+    if($_ex): ?>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:0 14px 12px">
+      <?php foreach($_ex as $lbl=>$val): ?>
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:8px 12px">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.4px;font-weight:700"><?= $lbl ?></div>
+        <div style="font-size:13px;color:var(--text);font-weight:600;margin-top:2px"><?= clean($val) ?></div>
+      </div>
+      <?php endforeach; ?>
     </div>
     <?php endif; ?>
 

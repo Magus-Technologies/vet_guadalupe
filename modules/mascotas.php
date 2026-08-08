@@ -1,10 +1,120 @@
 <?php
 $page = 'mascotas'; $pageTitle = 'Mascotas';
-require_once __DIR__ . '/../includes/header.php';
+// Cargar config (no el header todavía): así las acciones AJAX que devuelven JSON
+// —como la subida rápida de foto— pueden responder ANTES de imprimir el HTML.
+require_once __DIR__ . '/../includes/config.php';
+if (function_exists('requireLogin')) requireLogin();
 $db = getDB();
 
 $action = $_GET['action'] ?? 'list';
 $msg = '';
+$foto_error = '';
+
+/**
+ * Procesa $_FILES['foto'] para una mascota y devuelve ['foto'=>ruta|null,'error'=>msg].
+ * Reutilizable por el guardado del formulario y por la subida rápida del perfil.
+ */
+function vp_procesar_foto_mascota(PDO $db, $id) {
+    $out = ['foto'=>null, 'error'=>''];
+    if (empty($_FILES['foto']['tmp_name']) || (($_FILES['foto']['error'] ?? 1) !== UPLOAD_ERR_OK)) {
+        if (!empty($_FILES['foto']['name'])) $out['error']='No se pudo recibir la foto (código '.((int)($_FILES['foto']['error']??0)).'). Puede exceder el límite del servidor (post_max_size / upload_max_filesize).';
+        return $out;
+    }
+    // Detección robusta del tipo (algunos hostings deshabilitan mime_content_type)
+    $mime='';
+    if (function_exists('mime_content_type')) $mime=@mime_content_type($_FILES['foto']['tmp_name']);
+    if (!$mime || strncmp($mime,'image/',6)!==0) { $gi=@getimagesize($_FILES['foto']['tmp_name']); if($gi && !empty($gi['mime'])) $mime=$gi['mime']; }
+    if (!in_array($mime,['image/jpeg','image/png','image/webp','image/gif']) || $_FILES['foto']['size']>8*1024*1024) {
+        $out['error']='La imagen no es válida o supera 8MB (usa JPG, PNG o WEBP)'.($mime?" — tipo detectado: $mime":'').'.';
+        return $out;
+    }
+    $dir=UPLOADS_PATH.'/mascotas/';
+    if(!is_dir($dir)) @mkdir($dir,0755,true);
+    @chmod($dir,0755);
+    if ($id) { $old=$db->prepare("SELECT foto FROM mascotas WHERE id=?"); $old->execute([$id]); $o=$old->fetch(); if($o && !empty($o['foto']) && file_exists(UPLOADS_PATH.'/'.$o['foto'])) @unlink(UPLOADS_PATH.'/'.$o['foto']); }
+    $base='mascota_'.($id?:time()).'_'.uniqid();
+    @ini_set('memory_limit','256M');
+    $foto=null;
+    if (function_exists('imagecreatefromstring')) {
+        $src=@imagecreatefromstring(file_get_contents($_FILES['foto']['tmp_name']));
+        if($src){
+            $fname=$base.'.jpg'; // se reconvierte SIEMPRE a JPEG
+            $w=imagesx($src);$h=imagesy($src);$max=400;$nw=$w;$nh=$h;
+            if($w>$max||$h>$max){$r=$w>$h?$max/$w:$max/$h;$nw=(int)round($w*$r);$nh=(int)round($h*$r);}
+            $dst=imagecreatetruecolor($nw,$nh);
+            imagefilledrectangle($dst,0,0,$nw,$nh,imagecolorallocate($dst,255,255,255)); // fondo blanco
+            imagecopyresampled($dst,$src,0,0,0,0,$nw,$nh,$w,$h);
+            @imagejpeg($dst,$dir.$fname,90);imagedestroy($src);imagedestroy($dst);
+            if(file_exists($dir.$fname) && filesize($dir.$fname)>0){ @chmod($dir.$fname,0644); $foto='mascotas/'.$fname; }
+            elseif(file_exists($dir.$fname)) @unlink($dir.$fname);
+        }
+    }
+    if(!$foto){ // Sin GD o falló el redimensionado: guardar el original
+        $ext=$mime==='image/png'?'png':($mime==='image/webp'?'webp':($mime==='image/gif'?'gif':'jpg'));
+        $fname=$base.'.'.$ext;
+        if(move_uploaded_file($_FILES['foto']['tmp_name'],$dir.$fname)){ @chmod($dir.$fname,0644); $foto='mascotas/'.$fname; }
+    }
+    if(!$foto) $out['error']='No se pudo escribir la foto. Revisa que la carpeta public/uploads/mascotas tenga permiso de escritura (755/775).';
+    $out['foto']=$foto;
+    if($out['error']) @error_log('[VetPro mascotas] foto: '.$out['error']);
+    return $out;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Especies gestionables (agregar / eliminar) — igual que tipos de vacuna
+//   Se guardan en la tabla `especies`. El valor almacenado en
+//   mascotas.especie es el `nombre` en minúsculas (slug), y el ícono
+//   es un emoji configurable.
+// ─────────────────────────────────────────────────────────────
+try {
+    $db->exec("CREATE TABLE IF NOT EXISTS especies (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        nombre VARCHAR(50) NOT NULL,
+        icono VARCHAR(10) DEFAULT '🐾',
+        estado ENUM('activo','suspendido') NOT NULL DEFAULT 'activo',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+    // Sembrar con las especies por defecto la primera vez
+    $cnt = (int)$db->query("SELECT COUNT(*) FROM especies")->fetchColumn();
+    if ($cnt === 0) {
+        $semilla = [['perro','🐕'],['gato','🐈'],['conejo','🐰'],['ave','🐦'],['reptil','🦎'],['roedor','🐭'],['otro','🐾']];
+        $ins = $db->prepare("INSERT INTO especies (nombre,icono) VALUES (?,?)");
+        foreach ($semilla as $s) $ins->execute([$s[0],$s[1]]);
+    }
+    // La columna mascotas.especie debe ser VARCHAR para aceptar especies nuevas
+    // (originalmente era ENUM con una lista fija). Se convierte una sola vez.
+    $col = $db->query("SHOW COLUMNS FROM mascotas LIKE 'especie'")->fetch();
+    if ($col && stripos($col['Type'] ?? '', 'enum') !== false) {
+        $db->exec("ALTER TABLE mascotas MODIFY COLUMN especie VARCHAR(50) NOT NULL DEFAULT 'otro'");
+    }
+    // Ampliar el peso para admitir 3 decimales (ej. 4.560) y pesos grandes
+    $colp = $db->query("SHOW COLUMNS FROM mascotas LIKE 'peso'")->fetch();
+    if ($colp && stripos($colp['Type'] ?? '', '(7,3)') === false) {
+        $db->exec("ALTER TABLE mascotas MODIFY COLUMN peso DECIMAL(7,3) DEFAULT NULL");
+    }
+} catch (Exception $e) {}
+
+// Acciones del gestor de especies
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && in_array(($_POST['action']??''), ['esp_add','esp_edit'], true)) {
+    $esp_nombre = strtolower(trim($_POST['nombre'] ?? ''));
+    $esp_icono  = trim($_POST['icono'] ?? '') ?: '🐾';
+    if ($esp_nombre !== '') {
+        if ($_POST['action'] === 'esp_add') {
+            $dup = $db->prepare("SELECT id FROM especies WHERE nombre=? AND estado='activo'");
+            $dup->execute([$esp_nombre]);
+            if (!$dup->fetch()) $db->prepare("INSERT INTO especies (nombre,icono,estado) VALUES (?,?,'activo')")->execute([$esp_nombre,$esp_icono]);
+        } else {
+            $db->prepare("UPDATE especies SET nombre=?, icono=? WHERE id=?")->execute([$esp_nombre,$esp_icono,(int)($_POST['id']??0)]);
+        }
+    }
+    $action = 'especies';
+}
+if ($action === 'esp_suspender' && isset($_GET['id'])) {
+    $db->prepare("UPDATE especies SET estado='suspendido' WHERE id=?")->execute([(int)$_GET['id']]); $action='especies';
+}
+if ($action === 'esp_reactivar' && isset($_GET['id'])) {
+    $db->prepare("UPDATE especies SET estado='activo' WHERE id=?")->execute([(int)$_GET['id']]); $action='especies';
+}
 
 // ── POST: guardar ──
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
@@ -15,24 +125,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                    'color','chip_numero','alergias','condiciones','estado',
                    'grupo_sanguineo','personalidad','esterilizado','microchip','alimentacion','observaciones'];
         $data=[]; foreach($fields as $f) $data[$f]=trim($_POST[$f]??'')?:null;
+        // Normalizar peso: aceptar coma decimal y decimales (ej: "4,56" o "4.560")
+        if (!empty($data['peso'])) { $data['peso']=str_replace(',','.',$data['peso']); if(!is_numeric($data['peso'])) $data['peso']=null; }
+        // Guardar especie siempre en minúsculas (coincide con la lista de especies)
+        if (!empty($data['especie'])) $data['especie']=strtolower($data['especie']);
         // Asignar sede activa al crear mascota nueva
         $data['sede_id'] = getSede();
-        $foto_nueva=null;
-        if (!empty($_FILES['foto']['tmp_name']) && $_FILES['foto']['error']===UPLOAD_ERR_OK) {
-            $mime=mime_content_type($_FILES['foto']['tmp_name']);
-            if (in_array($mime,['image/jpeg','image/png','image/webp','image/gif']) && $_FILES['foto']['size']<=5*1024*1024) {
-                $dir=UPLOADS_PATH.'/mascotas/';
-                if(!is_dir($dir)) mkdir($dir,0755,true);
-                if ($id) { $old=$db->prepare("SELECT foto FROM mascotas WHERE id=?"); $old->execute([$id]); $oldrow=$old->fetch(); if($oldrow&&$oldrow['foto']&&file_exists(UPLOADS_PATH.'/'.$oldrow['foto'])) unlink(UPLOADS_PATH.'/'.$oldrow['foto']); }
-                $ext=$mime==='image/png'?'png':($mime==='image/webp'?'webp':'jpg');
-                $fname='mascota_'.($id?:time()).'_'.uniqid().'.'.$ext;
-                if (function_exists('imagecreatefromstring')) {
-                    $src=imagecreatefromstring(file_get_contents($_FILES['foto']['tmp_name']));
-                    if($src){$w=imagesx($src);$h=imagesy($src);$max=120;$nw=$w;$nh=$h;if($w>$max||$h>$max){$r=$w>$h?$max/$w:$max/$h;$nw=round($w*$r);$nh=round($h*$r);}$dst=imagecreatetruecolor($nw,$nh);imagecopyresampled($dst,$src,0,0,0,0,$nw,$nh,$w,$h);imagejpeg($dst,$dir.$fname,90);imagedestroy($src);imagedestroy($dst);$foto_nueva='mascotas/'.$fname;}
-                }
-                if(!$foto_nueva && move_uploaded_file($_FILES['foto']['tmp_name'],$dir.$fname)) $foto_nueva='mascotas/'.$fname;
-            }
-        }
+        $_fr = vp_procesar_foto_mascota($db, $id);
+        $foto_nueva = $_fr['foto']; if ($_fr['error']) $foto_error = $_fr['error'];
         // Agregar columnas extra si no existen (MariaDB 10.5 compatible)
         foreach(['grupo_sanguineo VARCHAR(10)','personalidad VARCHAR(200)','esterilizado TINYINT(1) DEFAULT 0','microchip TINYINT(1) DEFAULT 0','alimentacion TEXT','observaciones TEXT','sede_id INT DEFAULT 1'] as $col) {
             $colname = explode(' ', trim($col))[0];
@@ -85,14 +185,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $db->prepare("UPDATE mascotas SET foto=NULL WHERE id=?")->execute([$id]);
         header('Content-Type: application/json'); echo json_encode(['ok'=>true]); exit;
     }
+    // Subida rápida de foto (botón "Cambiar" del perfil): SOLO actualiza la columna foto,
+    // sin tocar los demás campos (antes mandaba la foto sin dueño/especie y el UPDATE fallaba).
+    if ($pa==='update_foto') {
+        $id=(int)($_POST['id']??0);
+        $_fr = vp_procesar_foto_mascota($db, $id);
+        if ($id && $_fr['foto']) $db->prepare("UPDATE mascotas SET foto=? WHERE id=?")->execute([$_fr['foto'],$id]);
+        header('Content-Type: application/json');
+        echo json_encode(['ok'=>(bool)$_fr['foto'], 'foto'=>$_fr['foto'], 'error'=>$_fr['error']]);
+        exit;
+    }
 }
 if ($action==='delete' && isset($_GET['id'])) {
     $db->prepare("UPDATE mascotas SET estado='dado_en_adopcion' WHERE id=?")->execute([(int)$_GET['id']]); $action='list';
 }
 
+// Recién aquí imprimimos la página (las acciones AJAX que devuelven JSON ya salieron con exit)
+require_once __DIR__ . '/../includes/header.php';
+
 $clientes_sel=$db->query("SELECT id,nombre,telefono FROM clientes WHERE activo=1 ORDER BY nombre")->fetchAll();
+// Especies desde la base de datos (gestionables). Se mantiene un respaldo por si la tabla falla.
 $especie_icons=['perro'=>'🐕','gato'=>'🐈','conejo'=>'🐰','ave'=>'🐦','reptil'=>'🦎','roedor'=>'🐭','otro'=>'🐾'];
-$especie_labels=['perro'=>'Perro','gato'=>'Gato','conejo'=>'Conejo','ave'=>'Ave','reptil'=>'Reptil','roedor'=>'Roedor','otro'=>'Otro'];
+$especie_labels=[];
+try {
+    $_esp_todas = $db->query("SELECT nombre,icono,estado FROM especies ORDER BY estado,nombre")->fetchAll();
+    foreach ($_esp_todas as $_e) {
+        // Usar el ícono de la BD SOLO para especies nuevas (las que no tienen emoji
+        // por defecto en el código) y solo si el emoji guardado es válido. Así, si un
+        // emoji quedó corrupto en la base ("??"), no reemplaza al ícono bueno del código.
+        $_ic = trim((string)($_e['icono'] ?? ''));
+        $_ic_valido = ($_ic !== '' && strpos($_ic,'?')===false && strpos($_ic,'�')===false && preg_match('//u',$_ic));
+        if (!isset($especie_icons[$_e['nombre']]) && $_ic_valido) {
+            $especie_icons[$_e['nombre']] = $_ic;
+        }
+        if ($_e['estado']==='activo') $especie_labels[$_e['nombre']] = ucfirst($_e['nombre']);
+    }
+} catch (Exception $e) {}
+// Respaldo si no hay especies activas cargadas
+if (empty($especie_labels)) $especie_labels=['perro'=>'Perro','gato'=>'Gato','conejo'=>'Conejo','ave'=>'Ave','reptil'=>'Reptil','roedor'=>'Roedor','otro'=>'Otro'];
+
+// Aviso si la mascota se guardó pero la foto no (para no fallar en silencio)
+if (!empty($foto_error)) echo '<div class="alert alert-warn mb-2" style="max-width:700px">⚠️ La mascota se guardó, pero la foto no se pudo adjuntar: '.htmlspecialchars($foto_error).'</div>';
 
 // ── VER perfil completo de mascota (imagen 2) ──
 if ($action==='ver' && isset($_GET['id'])) {
@@ -594,17 +727,96 @@ document.addEventListener('click', () => {
 async function uploadFoto(input, id) {
     if (!input.files[0]) return;
     const fd = new FormData();
-    fd.append('action','save'); fd.append('id',id);
+    fd.append('action','update_foto'); fd.append('id',id);
     fd.append('foto',input.files[0]);
-    fd.append('mascota_id',id);
-    const r = await fetch(window.location.href, {method:'POST', body:fd});
-    location.reload();
+    try {
+        const r = await fetch(window.location.href, {method:'POST', body:fd});
+        const txt = await r.text();
+        let d = null; try { d = JSON.parse(txt); } catch(e) { /* respuesta con HTML extra */ }
+        // Éxito si el servidor respondió 200 y no marcó error explícito
+        if (r.ok && (!d || d.ok !== false)) { location.reload(); return; }
+        alert((d && d.error) ? d.error : 'No se pudo guardar la foto. Inténtalo de nuevo.');
+    } catch(e) {
+        alert('No se pudo guardar la foto (error de red).');
+    }
 }
 </script>
 
 <?php require_once __DIR__ . '/../includes/footer.php'; ?>
 <?php
     return; // evitar que caiga al list_view
+}
+
+// ═══════════════════════════════════════
+// GESTOR DE ESPECIES (agregar / eliminar)
+// ═══════════════════════════════════════
+if ($action==='especies') {
+    $_esp_all = [];
+    try { $_esp_all = $db->query("SELECT id,nombre,icono,estado FROM especies ORDER BY estado,nombre")->fetchAll(); } catch(Exception $e){}
+    $_esp_act = array_filter($_esp_all, fn($t)=>$t['estado']==='activo');
+    $_esp_sus = array_filter($_esp_all, fn($t)=>$t['estado']==='suspendido');
+    ?>
+<div class="card" style="max-width:620px">
+  <div class="sec-header">
+    <div class="sec-title">⚙️ Gestionar especies</div>
+    <a href="?p=mascotas&action=nuevo" class="btn btn-sm">← Volver</a>
+  </div>
+
+  <!-- Agregar nueva especie -->
+  <form method="POST" style="display:flex;gap:8px;margin:14px 0 18px;align-items:flex-end">
+    <input type="hidden" name="action" value="esp_add">
+    <div class="form-group" style="width:70px;margin:0"><label class="form-label">Ícono</label>
+      <input class="form-input" name="icono" placeholder="🐾" maxlength="4" style="text-align:center">
+    </div>
+    <div class="form-group" style="flex:1;margin:0"><label class="form-label">Nueva especie</label>
+      <input class="form-input" name="nombre" placeholder="Ej: Hurón" required>
+    </div>
+    <button type="submit" class="btn btn-primary">＋ Agregar</button>
+  </form>
+
+  <!-- Especies activas -->
+  <div style="font-size:12px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Especies activas (<?= count($_esp_act) ?>)</div>
+  <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:20px">
+    <?php if(empty($_esp_act)): ?>
+      <div style="font-size:12px;color:var(--text3);padding:8px 0">No hay especies activas. Agrega una arriba.</div>
+    <?php else: foreach($_esp_act as $t): ?>
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg3);border-radius:8px">
+      <form method="POST" style="display:flex;flex:1;gap:6px;align-items:center;margin:0">
+        <input type="hidden" name="action" value="esp_edit">
+        <input type="hidden" name="id" value="<?= $t['id'] ?>">
+        <input class="form-input" name="icono" value="<?= clean($t['icono']) ?>" maxlength="4" style="width:52px;height:34px;text-align:center;font-size:15px">
+        <input class="form-input" name="nombre" value="<?= clean(ucfirst($t['nombre'])) ?>" style="flex:1;height:34px;font-size:13px">
+        <button type="submit" class="btn btn-sm" title="Guardar cambios">💾</button>
+      </form>
+      <a href="?p=mascotas&action=esp_suspender&id=<?= $t['id'] ?>"
+         onclick="return confirm('¿Eliminar esta especie de la lista? Quedará suspendida (no se borra) y dejará de aparecer al registrar mascotas. Las mascotas ya registradas conservan su especie.')"
+         class="btn btn-sm" style="color:var(--danger)" title="Eliminar (suspender)">🗑️</a>
+    </div>
+    <?php endforeach; endif; ?>
+  </div>
+
+  <!-- Especies suspendidas -->
+  <?php if(!empty($_esp_sus)): ?>
+  <div style="font-size:12px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Suspendidas (<?= count($_esp_sus) ?>)</div>
+  <div style="display:flex;flex-direction:column;gap:6px">
+    <?php foreach($_esp_sus as $t): ?>
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px dashed var(--border);border-radius:8px;opacity:.75">
+      <span style="font-size:15px"><?= clean($t['icono']) ?></span>
+      <span style="flex:1;font-size:13px;color:var(--text3);text-decoration:line-through"><?= clean(ucfirst($t['nombre'])) ?></span>
+      <a href="?p=mascotas&action=esp_reactivar&id=<?= $t['id'] ?>" class="btn btn-sm" style="color:var(--primary)" title="Reactivar">↩️ Reactivar</a>
+    </div>
+    <?php endforeach; ?>
+  </div>
+  <?php endif; ?>
+
+  <div style="font-size:11px;color:var(--text3);margin-top:16px;line-height:1.5">
+    💡 Al eliminar una especie se marca como <strong>suspendida</strong> (no se borra de la base de datos).
+    Las mascotas ya registradas con esa especie conservan su información.
+  </div>
+</div>
+<?php
+    require_once __DIR__ . '/../includes/footer.php';
+    return;
 }
 
 // ═══════════════════════════════════════
@@ -664,9 +876,19 @@ if (in_array($action,['nuevo','editar'])) {
           </div>
         </div>
         <div class="form-row">
-          <div class="form-group"><label class="form-label required">Especie</label>
-            <select class="form-input" name="especie" required onchange="document.getElementById('foto-emoji').textContent={'perro':'🐕','gato':'🐈','conejo':'🐰','ave':'🐦','reptil':'🦎','roedor':'🐭','otro':'🐾'}[this.value]||'🐾'">
-              <?php foreach($especie_labels as $k=>$v): ?><option value="<?= $k ?>" <?= ($editing['especie']??'perro')===$k?'selected':'' ?>><?= $v ?></option><?php endforeach; ?>
+          <div class="form-group"><label class="form-label required" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Especie</span>
+              <a href="?p=mascotas&action=especies" style="font-size:11px;font-weight:600;color:var(--primary);text-decoration:none">⚙️ Gestionar</a>
+            </label>
+            <?php
+              $_esp_icons_js = json_encode($especie_icons, JSON_UNESCAPED_UNICODE);
+              $_esp_actual = strtolower($editing['especie'] ?? 'perro');
+              // Si la especie actual está suspendida y no aparece en la lista activa, agregarla igual para no perderla
+              $_esp_opts = $especie_labels;
+              if ($_esp_actual && !isset($_esp_opts[$_esp_actual])) $_esp_opts[$_esp_actual] = ucfirst($_esp_actual);
+            ?>
+            <select class="form-input" name="especie" required onchange="document.getElementById('foto-emoji').textContent=(<?= $_esp_icons_js ?>)[this.value]||'🐾'">
+              <?php foreach($_esp_opts as $k=>$v): ?><option value="<?= $k ?>" <?= $_esp_actual===$k?'selected':'' ?>><?= $v ?></option><?php endforeach; ?>
             </select>
           </div>
           <div class="form-group"><label class="form-label">Raza</label>
@@ -686,7 +908,7 @@ if (in_array($action,['nuevo','editar'])) {
     </div>
     <div class="form-row">
       <div class="form-group"><label class="form-label">Peso (kg)</label>
-        <input class="form-input" type="number" step="0.1" name="peso" value="<?= clean($editing['peso']??'') ?>">
+        <input class="form-input" type="number" step="0.001" min="0" name="peso" value="<?= clean($editing['peso']??'') ?>" placeholder="Ej: 4.560">
       </div>
       <div class="form-group"><label class="form-label">Color / Pelaje</label>
         <input class="form-input" name="color" value="<?= clean($editing['color']??'') ?>">

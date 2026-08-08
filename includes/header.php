@@ -94,9 +94,6 @@ $nav = [
   ['icon'=>'🏢', 'label'=>'Multi-Sede',        'page'=>'sedes',          'section'=>''],
   ['icon'=>'⚙️', 'label'=>'Configuración',     'page'=>'configuracion',  'section'=>''],
 ];
-
-/* El módulo de mantenimiento SUNAT NO se lista en el menú a propósito: se entra
-   solo con el link que lleva MANTENIMIENTO_TOKEN. Ver modules/reenvio_sunat.php */
 ?>
 <!DOCTYPE html>
 <html lang="es">

@@ -39,6 +39,9 @@ try {
     // idempotente: agregar 'dni' si la tabla ya existía sin esa columna
     $c = $db->query("SHOW COLUMNS FROM solicitudes_cita LIKE 'dni'")->fetchAll();
     if (empty($c)) $db->exec("ALTER TABLE solicitudes_cita ADD COLUMN dni VARCHAR(8) NULL AFTER sede_id");
+    // idempotente: mascota_id (cuando el dueño elige una mascota ya registrada)
+    $cm = $db->query("SHOW COLUMNS FROM solicitudes_cita LIKE 'mascota_id'")->fetchAll();
+    if (empty($cm)) $db->exec("ALTER TABLE solicitudes_cita ADD COLUMN mascota_id INT NULL AFTER mascota_especie");
 } catch (Exception $e) {}
 
 $cfg     = $db->query("SELECT clave,valor FROM configuracion")->fetchAll(PDO::FETCH_KEY_PAIR);
@@ -47,6 +50,12 @@ $clinica = trim($cfg['nombre_clinica'] ?? $cfg['clinica_nombre'] ?? 'VetPro') ?:
 try { $sedes = $db->query("SELECT id,nombre FROM sedes WHERE activo=1 ORDER BY nombre")->fetchAll(); } catch(Exception $e){ $sedes=[]; }
 if (empty($sedes)) $sedes = [['id'=>1,'nombre'=>'Sede principal']];
 try { $servicios = $db->query("SELECT id,nombre,tipo FROM servicios WHERE activo=1 ORDER BY tipo,nombre")->fetchAll(); } catch(Exception $e){ $servicios=[]; }
+
+// ── Triaje (Fase 2): preguntas de prioridad en la reserva online ──
+require_once __DIR__ . '/includes/triaje_lib.php';
+triaje_bootstrap($db);
+$tri_plantilla = triaje_plantilla_activa($db);
+$tri_campos    = $tri_plantilla ? triaje_campos($db, (int)$tri_plantilla['id'], true) : [];
 
 $ok = false; $err = '';
 
@@ -83,27 +92,100 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $tel_norm = preg_replace('/[^0-9]/','', $dtel);
 
+    // Mascotas ya registradas seleccionadas (por id) + posible mascota nueva
+    $mascota_ids = array_values(array_filter(array_map('intval', (array)($_POST['mascota_ids'] ?? []))));
+
+    // Si el DNI corresponde a un cliente registrado, validar las mascotas elegidas
+    $cliente_reg = null; $mascotas_reg = [];
+    if (strlen($dni) === 8) {
+        try {
+            $cq = $db->prepare("SELECT id,nombre FROM clientes WHERE dni=? AND activo=1 LIMIT 1");
+            $cq->execute([$dni]); $cliente_reg = $cq->fetch(PDO::FETCH_ASSOC) ?: null;
+            if ($cliente_reg && $mascota_ids) {
+                $in = implode(',', array_fill(0, count($mascota_ids), '?'));
+                $mq = $db->prepare("SELECT id,nombre,especie FROM mascotas WHERE cliente_id=? AND id IN ($in)");
+                $mq->execute(array_merge([$cliente_reg['id']], $mascota_ids));
+                foreach ($mq->fetchAll(PDO::FETCH_ASSOC) as $r) $mascotas_reg[] = $r;
+            }
+        } catch (Exception $e) {}
+    }
+
+    // Construir la lista de mascotas a reservar
+    $lista = [];
+    foreach ($mascotas_reg as $r) $lista[] = ['id'=>(int)$r['id'], 'nombre'=>$r['nombre'], 'especie'=>($r['especie']?:'otro')];
+    if ($mnom !== '') $lista[] = ['id'=>null, 'nombre'=>$mnom, 'especie'=>$mesp]; // mascota nueva
+
     if ($dni !== '' && strlen($dni) !== 8) {
         $err = 'El DNI debe tener 8 dígitos.';
-    } elseif ($dnom==='' || $tel_norm==='' || $mnom==='' || $fecha==='') {
-        $err = 'Por favor completa tu nombre, teléfono, el nombre de tu mascota y la fecha deseada.';
+    } elseif ($cliente_reg && !$mascota_ids && $mnom === '') {
+        $err = 'Ya estás registrado. Selecciona al menos una de tus mascotas (o agrega una nueva).';
+    } elseif ($dnom==='' || $tel_norm==='' || empty($lista) || $fecha==='') {
+        $err = 'Por favor completa tu nombre, teléfono, al menos una mascota y la fecha deseada.';
     } elseif (strtotime($fecha) < strtotime(date('Y-m-d'))) {
         $err = 'La fecha deseada no puede ser anterior a hoy.';
     } elseif ($hora !== '' && !_slotDisponible($db, $sede_id, $fecha, $hora, 30)) {
         $err = 'Ese horario ('.date('d/m/Y',strtotime($fecha)).' a las '.substr($hora,0,5).') ya está reservado. Por favor elige otra hora.';
     } else {
         try {
-            $db->prepare("INSERT INTO solicitudes_cita
-                (sede_id,dni,servicio_id,tipo,dueno_nombre,dueno_telefono,dueno_email,mascota_nombre,mascota_especie,fecha_preferida,hora_preferida,motivo)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
-               ->execute([$sede_id,($dni?:null),$serv_id,$tipo,$dnom,$tel_norm,($dmail?:null),$mnom,$mesp,$fecha,($hora?:null),($motivo?:null)]);
+            // ── Calcular prioridad (triaje) una vez con las respuestas del formulario ──
+            $tri = null; $peor_nivel = null;
+            if ($tri_plantilla && $tri_campos) {
+                $tri = triaje_calcular($tri_campos, $_POST['r'] ?? [], [
+                    'amarillo'=>(int)$tri_plantilla['umbral_amarillo'],
+                    'naranja' =>(int)$tri_plantilla['umbral_naranja'],
+                    'rojo'    =>(int)$tri_plantilla['umbral_rojo'],
+                ]);
+                // Solo se considera "triaje real" si el dueño respondió algo
+                $respondio = false; foreach (($_POST['r'] ?? []) as $rv) { if (trim((string)$rv)!=='') { $respondio=true; break; } }
+                if (!$respondio) $tri = null; else $peor_nivel = $tri['nivel'];
+            }
+
+            // Una solicitud por cada mascota (así el historial de cada una queda separado)
+            $ins = $db->prepare("INSERT INTO solicitudes_cita
+                (sede_id,dni,servicio_id,tipo,dueno_nombre,dueno_telefono,dueno_email,mascota_nombre,mascota_especie,mascota_id,fecha_preferida,hora_preferida,motivo)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)");
+            $tri_ins = $db->prepare("INSERT INTO triaje (plantilla_id,plantilla_version,sede_id,cliente_id,mascota_id,solicitud_id,canal,motivo,respuestas,puntaje,nivel,banderas)
+                                     VALUES (?,?,?,?,?,?, 'portal', ?,?,?,?,?)");
+            $sol_upd = $db->prepare("UPDATE solicitudes_cita SET triaje_id=?, triaje_nivel=? WHERE id=?");
+            foreach ($lista as $mp) {
+                $ins->execute([$sede_id,($dni?:null),$serv_id,$tipo,$dnom,$tel_norm,($dmail?:null),$mp['nombre'],$mp['especie'],$mp['id'],$fecha,($hora?:null),($motivo?:null)]);
+                $sol_id = (int)$db->lastInsertId();
+                if ($tri) {
+                    try {
+                        $tri_ins->execute([
+                            $tri_plantilla['id'], $tri_plantilla['version'], $sede_id,
+                            ($cliente_reg['id'] ?? null), $mp['id'], $sol_id,
+                            substr($motivo,0,255),
+                            json_encode($tri['snapshot'], JSON_UNESCAPED_UNICODE),
+                            $tri['puntaje'], $tri['nivel'],
+                            ($tri['banderas'] ? json_encode($tri['banderas'], JSON_UNESCAPED_UNICODE) : null),
+                        ]);
+                        $sol_upd->execute([(int)$db->lastInsertId(), $tri['nivel'], $sol_id]);
+                    } catch (Exception $e) { /* no bloquear la reserva por el triaje */ }
+                }
+            }
             $ok = true;
-            // Aviso de recepción por WhatsApp (best-effort; no bloquea si falla)
+            $f = date('d/m/Y', strtotime($fecha));
+            $nombres = implode(', ', array_map(fn($m)=>$m['nombre'], $lista));
+            // Aviso al dueño por WhatsApp (best-effort)
             try {
-                $f = date('d/m/Y', strtotime($fecha));
-                $msg = "🐾 *{$clinica}*\n\nHola {$dnom} 👋\n\nRecibimos tu *solicitud de cita* para *{$mnom}*:\n📅 {$f}".($hora?(' · '.substr($hora,0,5)):'')."\n\nTe confirmaremos por este medio en cuanto la revisemos. ¡Gracias! 🐾";
+                $msg = "🐾 *{$clinica}*\n\nHola {$dnom} 👋\n\nRecibimos tu *solicitud de cita* para *{$nombres}*:\n📅 {$f}".($hora?(' · '.substr($hora,0,5)):'')."\n\nTe confirmaremos por este medio en cuanto la revisemos. ¡Gracias! 🐾";
                 @wa_enviar($tel_norm, $msg);
             } catch (Exception $e) {}
+            // Alerta a la clínica si el triaje es urgente (rojo/naranja)
+            if ($peor_nivel && in_array($peor_nivel, ['rojo','naranja'], true)) {
+                try {
+                    $tel_clinica = preg_replace('/[^0-9]/','', $cfg['telefono_clinica'] ?? $cfg['telefono'] ?? '');
+                    // Normalizar: si viene sin código de país (9 dígitos), anteponer 51 (Perú)
+                    if ($tel_clinica !== '' && strlen($tel_clinica) < 11) $tel_clinica = '51'.$tel_clinica;
+                    if ($tel_clinica !== '') {
+                        $NIVc = triaje_niveles(); $etq = $NIVc[$peor_nivel][0];
+                        $bnd  = ($tri && !empty($tri['banderas'])) ? "\n⚠️ ".implode(', ', $tri['banderas']) : '';
+                        $alerta = "🚨 *Triaje: {$etq}* — reserva web\n\nMascota: *{$nombres}*\nDueño: {$dnom} ({$dtel})\nMotivo: ".($motivo?:'—')."\n📅 {$f}".($hora?(' · '.substr($hora,0,5)):'').$bnd."\n\n👉 Revísalo en *Solicitudes*.";
+                        @wa_enviar($tel_clinica, $alerta);
+                    }
+                } catch (Exception $e) {}
+            }
         } catch (Exception $e) {
             $err = 'No pudimos registrar tu solicitud en este momento. Intenta nuevamente.';
         }
@@ -180,6 +262,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--teal);box-shadow:0 0 
           <span id="dni-msg" style="position:absolute;right:12px;top:12px;font-size:12px"></span>
         </div>
       </div>
+      <div id="dni-registrado" style="display:none;font-size:12.5px;background:var(--teal-l);color:var(--teal-d);border-radius:8px;padding:9px 12px;margin:-4px 0 12px"></div>
       <div class="grp"><label>Tu nombre <span class="req">*</span></label>
         <input name="dueno_nombre" id="dueno_nombre" maxlength="150" required placeholder="Nombre y apellido">
       </div>
@@ -193,9 +276,19 @@ input:focus,select:focus,textarea:focus{border-color:var(--teal);box-shadow:0 0 
       </div>
 
       <div class="sec">🐾 Tu mascota</div>
-      <div class="row">
-        <div class="grp"><label>Nombre de la mascota <span class="req">*</span></label>
-          <input name="mascota_nombre" maxlength="100" required placeholder="Ej: Firulais">
+
+      <!-- Mascotas ya registradas (aparece si el DNI es un cliente existente) -->
+      <div id="mascotas-reg" style="display:none;margin-bottom:12px">
+        <label style="margin-bottom:6px">Selecciona la(s) mascota(s) a atender <span class="req">*</span></label>
+        <div id="mascotas-lista" style="display:flex;flex-direction:column;gap:6px"></div>
+        <button type="button" id="btn-nueva-mascota" onclick="mostrarNuevaMascota()"
+                style="margin-top:8px;background:none;border:1px dashed var(--border);color:var(--teal-d);border-radius:8px;padding:9px;font-family:inherit;font-size:12.5px;cursor:pointer;width:100%">➕ Agregar una mascota nueva</button>
+      </div>
+
+      <!-- Mascota nueva (clientes nuevos, o mascota adicional no registrada) -->
+      <div id="mascota-nueva" class="row">
+        <div class="grp"><label>Nombre de la mascota</label>
+          <input name="mascota_nombre" id="mascota_nombre" maxlength="100" placeholder="Ej: Firulais">
         </div>
         <div class="grp"><label>Especie</label>
           <select name="mascota_especie"><?php foreach($especies as $k=>$lbl): ?><option value="<?= $k ?>"><?= $lbl ?></option><?php endforeach; ?></select>
@@ -231,6 +324,22 @@ input:focus,select:focus,textarea:focus{border-color:var(--teal);box-shadow:0 0 
         <textarea name="motivo" rows="3" maxlength="500" placeholder="Cuéntanos brevemente el motivo de la visita"></textarea>
       </div>
 
+      <?php if (!empty($tri_campos)): ?>
+      <div class="sec">🩺 ¿Cómo está tu mascota?</div>
+      <div style="font-size:12.5px;color:#64748b;margin:-4px 2px 8px">Esto nos ayuda a priorizar la atención. Es opcional, pero muy útil si es una urgencia.</div>
+      <?php foreach ($tri_campos as $c):
+        $opts = $c['opciones'] ? (json_decode($c['opciones'], true) ?: []) : [];
+        if (!in_array($c['tipo'], ['select','boolean']) || !$opts) continue;
+      ?>
+      <div class="grp"><label><?= htmlspecialchars($c['etiqueta']) ?></label>
+        <select name="r[<?= htmlspecialchars($c['clave']) ?>]">
+          <option value="">— Selecciona —</option>
+          <?php foreach ($opts as $o): ?><option value="<?= htmlspecialchars($o['valor']) ?>"><?= htmlspecialchars($o['etiqueta']) ?></option><?php endforeach; ?>
+        </select>
+      </div>
+      <?php endforeach; ?>
+      <?php endif; ?>
+
       <button class="btn" type="submit">📩 Enviar solicitud</button>
     </form>
   </div>
@@ -246,24 +355,53 @@ if (serv) serv.addEventListener('change', function(){
   tipo.value = (o && o.getAttribute('data-tipo')) ? o.getAttribute('data-tipo') : 'consulta';
 });
 
-// Autocompletar nombre desde el DNI (RENIEC) vía endpoint público
+// DNI: primero verifica si ya es cliente (para jalar sus mascotas); si no, RENIEC
 var dni = document.getElementById('dni'), nom = document.getElementById('dueno_nombre'), dmsg = document.getElementById('dni-msg');
+var regBox = document.getElementById('dni-registrado'), masReg = document.getElementById('mascotas-reg'),
+    masLista = document.getElementById('mascotas-lista'), masNueva = document.getElementById('mascota-nueva');
+function _esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function resetMascotas(){ if(masReg)masReg.style.display='none'; if(masLista)masLista.innerHTML=''; if(regBox)regBox.style.display='none'; if(masNueva)masNueva.style.display=''; var b=document.getElementById('btn-nueva-mascota'); if(b)b.style.display=''; }
+function mostrarNuevaMascota(){ if(masNueva)masNueva.style.display=''; var b=document.getElementById('btn-nueva-mascota'); if(b)b.style.display='none'; }
+
 if (dni) dni.addEventListener('input', function(){
   var v = dni.value.replace(/\D/g,''); dni.value = v;
-  if (v.length !== 8) { dmsg.textContent = ''; return; }
+  if (v.length !== 8) { dmsg.textContent=''; resetMascotas(); return; }
   dmsg.textContent = '⏳'; dmsg.style.color = '#6e8589';
-  fetch('api/consulta_dni_publico.php?numero=' + v)
+  fetch('api/cliente_mascotas_publico.php?dni=' + v)
     .then(function(r){ return r.json(); })
     .then(function(d){
-      if (d && d.ok && d.nombre) {
-        if (!nom.value.trim()) nom.value = d.nombre;
+      if (d && d.ok && d.registrado) {
+        var cn = (d.cliente && d.cliente.nombre) ? d.cliente.nombre : '';
+        if (nom && cn) nom.value = cn;
         dmsg.textContent = '✓'; dmsg.style.color = '#0e9c8b';
+        if (regBox){ regBox.style.display='block';
+          regBox.innerHTML = '✅ Ya estás registrado como <strong>'+_esc(cn)+'</strong>. Selecciona la(s) mascota(s) que traerás. Usa siempre <strong>este mismo DNI</strong> para no duplicar tu registro.'; }
+        if (masLista){
+          if (d.mascotas && d.mascotas.length){
+            masLista.innerHTML = d.mascotas.map(function(m){
+              var ic = ({perro:'🐕',gato:'🐈',conejo:'🐰',ave:'🐦',reptil:'🦎',roedor:'🐭'})[m.especie] || '🐾';
+              return '<label style="display:flex;align-items:center;gap:8px;padding:9px 11px;border:1px solid var(--border);border-radius:8px;cursor:pointer">'
+                + '<input type="checkbox" name="mascota_ids[]" value="'+m.id+'" style="width:auto;margin:0"> '+ic+' <span>'+_esc(m.nombre)+'</span></label>';
+            }).join('');
+          } else {
+            masLista.innerHTML = '<div style="font-size:12.5px;color:var(--text3)">No tienes mascotas registradas. Agrega una nueva abajo.</div>';
+          }
+        }
+        if (masReg) masReg.style.display='block';
+        if (masNueva) masNueva.style.display='none';
+        var b=document.getElementById('btn-nueva-mascota'); if(b) b.style.display='';
       } else {
-        dmsg.textContent = '✕'; dmsg.style.color = '#e15b5b';
-        dmsg.title = (d && d.error) ? d.error : 'No encontrado';
+        // No registrado: RENIEC para autocompletar el nombre + modo mascota nueva
+        resetMascotas();
+        fetch('api/consulta_dni_publico.php?numero=' + v)
+          .then(function(r){ return r.json(); })
+          .then(function(rn){
+            if (rn && rn.ok && rn.nombre) { if (nom && !nom.value.trim()) nom.value = rn.nombre; dmsg.textContent='✓'; dmsg.style.color='#0e9c8b'; }
+            else { dmsg.textContent='✕'; dmsg.style.color='#e15b5b'; }
+          }).catch(function(){ dmsg.textContent=''; });
       }
     })
-    .catch(function(){ dmsg.textContent = ''; });
+    .catch(function(){ dmsg.textContent=''; resetMascotas(); });
 });
 
 // Disponibilidad de horario en vivo

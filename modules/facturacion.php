@@ -1043,7 +1043,7 @@ if (isset($_SESSION['flash_error'])) {
   $num_cmp = $venta_detalle['serie'].'-'.str_pad($venta_detalle['numero'],6,'0',STR_PAD_LEFT);
   $url_cmp = BASE_URL.'/print/ver.php?serie='.urlencode($venta_detalle['serie']).'&num='.$venta_detalle['numero'];
   $tipo_wa = ['boleta'=>'BOLETA','factura'=>'FACTURA','ticket'=>'NOTA DE VENTA'];
-  $wa_msg  = "🧾 *".($tipo_wa[$venta_detalle['tipo_comprobante']]??'COMPROBANTE')." VetPro*\n";
+  $wa_msg  = "🧾 *".($tipo_wa[$venta_detalle['tipo_comprobante']]??'COMPROBANTE')." Vet House Guadalupe*\n";
   $wa_msg .= "N° $num_cmp\n\n";
   $wa_msg .= "👤 Cliente: {$venta_detalle['cliente']}\n";
   $wa_msg .= "📅 Fecha: ".date('d/m/Y',strtotime($venta_detalle['fecha']))."\n\n";
@@ -1054,7 +1054,7 @@ if (isset($_SESSION['flash_error'])) {
   $wa_msg .= "\n💰 *Total: S/. ".number_format($venta_detalle['total'],2)."*\n";
   $wa_msg .= "💳 Pago: ".ucfirst(str_replace('_',' ',$venta_detalle['metodo_pago']))." ✅\n\n";
   $wa_msg .= "📄 Ver comprobante:\n$url_cmp\n\n";
-  $wa_msg .= "¡Gracias por confiar en VetPro 🐾!";
+  $wa_msg .= "Cuidado, amor y bienestar para quienes son parte de tu familia ❤️ 🩺";
   ?>
   <a href="https://wa.me/<?= $tel ?>?text=<?= rawurlencode($wa_msg) ?>" target="_blank"
      class="btn btn-wa" style="width:100%;justify-content:center;font-size:14px;padding:12px">

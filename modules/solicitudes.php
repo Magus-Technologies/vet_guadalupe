@@ -2,7 +2,10 @@
 $page = 'solicitudes'; $pageTitle = 'Solicitudes de cita';
 require_once __DIR__ . '/../includes/config.php';
 require_once __DIR__ . '/../includes/wa_notify.php';
+require_once __DIR__ . '/../includes/triaje_lib.php';
 $db = getDB();
+triaje_bootstrap($db);        // asegura columnas de triaje en solicitudes_cita/citas
+$NIVELES = triaje_niveles();
 $action = $_GET['action'] ?? 'list';
 
 // ── Migración idempotente (por si el módulo se abre antes que reservar.php) ──
@@ -18,6 +21,8 @@ try {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
     $c = $db->query("SHOW COLUMNS FROM solicitudes_cita LIKE 'dni'")->fetchAll();
     if (empty($c)) $db->exec("ALTER TABLE solicitudes_cita ADD COLUMN dni VARCHAR(8) NULL AFTER sede_id");
+    $cm = $db->query("SHOW COLUMNS FROM solicitudes_cita LIKE 'mascota_id'")->fetchAll();
+    if (empty($cm)) $db->exec("ALTER TABLE solicitudes_cita ADD COLUMN mascota_id INT NULL AFTER mascota_especie");
     // origen en citas: distinguir reservas web de las agendadas en clínica
     $co = $db->query("SHOW COLUMNS FROM citas LIKE 'origen'")->fetchAll();
     if (empty($co)) $db->exec("ALTER TABLE citas ADD COLUMN origen ENUM('interno','web') NOT NULL DEFAULT 'interno'");
@@ -59,33 +64,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'acept
     else {
         try {
             $db->beginTransaction();
-            // 1) Cliente: buscar por DNI (llave real), luego por teléfono; si no, crear
-            $dni     = preg_replace('/\D/','', $sol['dni'] ?? '');
-            $telnorm = preg_replace('/[^0-9]/','',$sol['dueno_telefono']);
-            $cliente_id = 0;
-            if (strlen($dni) === 8) {
-                $c = $db->prepare("SELECT id FROM clientes WHERE dni=? AND activo=1 LIMIT 1");
-                $c->execute([$dni]); $cliente_id = (int)($c->fetchColumn() ?: 0);
+            $cliente_id = 0; $mascota_id = 0;
+
+            // 0) Si la solicitud trae una mascota YA REGISTRADA, usarla directo (evita duplicados)
+            if (!empty($sol['mascota_id'])) {
+                $mm = $db->prepare("SELECT id,cliente_id FROM mascotas WHERE id=? LIMIT 1");
+                $mm->execute([(int)$sol['mascota_id']]); $mrow = $mm->fetch(PDO::FETCH_ASSOC);
+                if ($mrow) { $mascota_id = (int)$mrow['id']; $cliente_id = (int)$mrow['cliente_id']; }
             }
-            if (!$cliente_id && $telnorm !== '') {
-                $c = $db->prepare("SELECT id FROM clientes WHERE REPLACE(REPLACE(REPLACE(telefono,' ',''),'-',''),'+','')=? AND activo=1 LIMIT 1");
-                $c->execute([$telnorm]); $cliente_id = (int)($c->fetchColumn() ?: 0);
-            }
-            if (!$cliente_id) {
-                $db->prepare("INSERT INTO clientes (sede_id,nombre,dni,telefono,email,como_conocio,activo) VALUES (?,?,?,?,?, 'otro',1)")
-                   ->execute([$sol['sede_id'],$sol['dueno_nombre'],($dni?:null),$sol['dueno_telefono'],($sol['dueno_email']?:null)]);
-                $cliente_id = (int)$db->lastInsertId();
-            } elseif (strlen($dni) === 8) {
-                // Si el cliente existía (por teléfono) pero sin DNI, lo completamos
-                try { $db->prepare("UPDATE clientes SET dni=? WHERE id=? AND (dni IS NULL OR dni='')")->execute([$dni,$cliente_id]); } catch(Exception $e){}
-            }
-            // 2) Mascota: misma del cliente por nombre (no duplica); si no, crear
-            $mas = $db->prepare("SELECT id FROM mascotas WHERE cliente_id=? AND TRIM(LOWER(nombre))=TRIM(LOWER(?)) LIMIT 1");
-            $mas->execute([$cliente_id,$sol['mascota_nombre']]); $mascota_id = (int)($mas->fetchColumn() ?: 0);
+
             if (!$mascota_id) {
-                $db->prepare("INSERT INTO mascotas (cliente_id,sede_id,nombre,especie,estado) VALUES (?,?,?,?, 'activo')")
-                   ->execute([$cliente_id,$sol['sede_id'],$sol['mascota_nombre'],$sol['mascota_especie']]);
-                $mascota_id = (int)$db->lastInsertId();
+                // 1) Cliente: buscar por DNI (llave real), luego por teléfono; si no, crear
+                $dni     = preg_replace('/\D/','', $sol['dni'] ?? '');
+                $telnorm = preg_replace('/[^0-9]/','',$sol['dueno_telefono']);
+                if (strlen($dni) === 8) {
+                    $c = $db->prepare("SELECT id FROM clientes WHERE dni=? AND activo=1 LIMIT 1");
+                    $c->execute([$dni]); $cliente_id = (int)($c->fetchColumn() ?: 0);
+                }
+                if (!$cliente_id && $telnorm !== '') {
+                    $c = $db->prepare("SELECT id FROM clientes WHERE REPLACE(REPLACE(REPLACE(telefono,' ',''),'-',''),'+','')=? AND activo=1 LIMIT 1");
+                    $c->execute([$telnorm]); $cliente_id = (int)($c->fetchColumn() ?: 0);
+                }
+                if (!$cliente_id) {
+                    $db->prepare("INSERT INTO clientes (sede_id,nombre,dni,telefono,email,como_conocio,activo) VALUES (?,?,?,?,?, 'otro',1)")
+                       ->execute([$sol['sede_id'],$sol['dueno_nombre'],($dni?:null),$sol['dueno_telefono'],($sol['dueno_email']?:null)]);
+                    $cliente_id = (int)$db->lastInsertId();
+                } elseif (strlen($dni) === 8) {
+                    try { $db->prepare("UPDATE clientes SET dni=? WHERE id=? AND (dni IS NULL OR dni='')")->execute([$dni,$cliente_id]); } catch(Exception $e){}
+                }
+                // 2) Mascota: misma del cliente por nombre (no duplica); si no, crear
+                $mas = $db->prepare("SELECT id FROM mascotas WHERE cliente_id=? AND TRIM(LOWER(nombre))=TRIM(LOWER(?)) LIMIT 1");
+                $mas->execute([$cliente_id,$sol['mascota_nombre']]); $mascota_id = (int)($mas->fetchColumn() ?: 0);
+                if (!$mascota_id) {
+                    $db->prepare("INSERT INTO mascotas (cliente_id,sede_id,nombre,especie,estado) VALUES (?,?,?,?, 'activo')")
+                       ->execute([$cliente_id,$sol['sede_id'],$sol['mascota_nombre'],$sol['mascota_especie']]);
+                    $mascota_id = (int)$db->lastInsertId();
+                }
             }
             // 3) Crear la cita CONFIRMADA (normalizar tipo al ENUM de citas)
             $tipos_cita = ['consulta','vacuna','control','cirugia','bano','grooming','emergencia','hospitalizacion'];
@@ -95,6 +109,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'acept
                           VALUES (?,?,?,?,?,?,?, 'confirmada', ?, 'web')")
                ->execute([$sol['sede_id'],$mascota_id,$vetid,$tipo_cita,$fecha,$hora,$dur,($sol['motivo']?:'Cita reservada por la web')]);
             $cita_id = (int)$db->lastInsertId();
+            // 3b) Llevar la prioridad del triaje online a la cita creada
+            if (!empty($sol['triaje_id'])) {
+                try {
+                    $db->prepare("UPDATE citas SET triaje_nivel=?, triaje_id=? WHERE id=?")
+                       ->execute([($sol['triaje_nivel'] ?? null), (int)$sol['triaje_id'], $cita_id]);
+                    $db->prepare("UPDATE triaje SET mascota_id=?, cliente_id=?, cita_id=? WHERE id=?")
+                       ->execute([$mascota_id, $cliente_id, $cita_id, (int)$sol['triaje_id']]);
+                } catch (Exception $e) {}
+            }
             // 4) Marcar la solicitud como aceptada
             $db->prepare("UPDATE solicitudes_cita SET estado='aceptada', cliente_id=?, mascota_id=?, veterinario_id=?, cita_id=?, updated_at=NOW() WHERE id=?")
                ->execute([$cliente_id,$mascota_id,$vetid,$cita_id,$sid]);
@@ -147,7 +170,9 @@ if (!empty($_SESSION['flash'])) { [$ft,$fm]=array_pad(explode(':',$_SESSION['fla
 $filtro = $_GET['estado'] ?? 'pendiente';
 $filtro = in_array($filtro,['pendiente','aceptada','rechazada','todas'],true) ? $filtro : 'pendiente';
 $wsql = $filtro==='todas' ? '' : "WHERE estado=".$db->quote($filtro);
-$sols = $db->query("SELECT * FROM solicitudes_cita $wsql ORDER BY (estado='pendiente') DESC, created_at DESC LIMIT 200")->fetchAll();
+$sols = $db->query("SELECT * FROM solicitudes_cita $wsql ORDER BY (estado='pendiente') DESC,
+    CASE triaje_nivel WHEN 'rojo' THEN 0 WHEN 'naranja' THEN 1 WHEN 'amarillo' THEN 2 WHEN 'verde' THEN 3 ELSE 4 END,
+    created_at DESC LIMIT 200")->fetchAll();
 $n_pend = (int)$db->query("SELECT COUNT(*) FROM solicitudes_cita WHERE estado='pendiente'")->fetchColumn();
 
 $vets = $db->query("SELECT id,nombre FROM usuarios WHERE rol IN ('veterinario','admin') AND activo=1 ORDER BY nombre")->fetchAll();
@@ -180,6 +205,9 @@ $badge=['pendiente'=>['#fef3c7','#b45309','Pendiente'],'aceptada'=>['#dcfce7','#
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
             <span style="font-weight:700;font-size:15px"><?= clean($s['mascota_nombre']) ?></span>
             <span class="badge" style="background:<?= $bg[0] ?>;color:<?= $bg[1] ?>"><?= $bg[2] ?></span>
+            <?php if(!empty($s['triaje_nivel']) && isset($NIVELES[$s['triaje_nivel']])): $nv=$NIVELES[$s['triaje_nivel']]; ?>
+              <span class="badge" style="background:<?= $nv[1] ?>;color:#fff" title="Prioridad del triaje online">🚦 <?= $nv[0] ?></span>
+            <?php endif; ?>
           </div>
           <div class="text-xs text-muted" style="margin-top:3px">
             👤 <?= clean($s['dueno_nombre']) ?><?= !empty($s['dni'])?' · <b>DNI</b> '.clean($s['dni']):'' ?> · 📱 <?= clean($s['dueno_telefono']) ?><?= $s['dueno_email']?' · '.clean($s['dueno_email']):'' ?>
