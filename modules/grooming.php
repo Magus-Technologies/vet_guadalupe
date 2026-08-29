@@ -67,6 +67,16 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $estados_ok=['programado','en_proceso','completado','cancelado'];
     $nuevo = $_POST['estado']??'';
     if(in_array($nuevo,$estados_ok)) {
+      if ($nuevo === 'completado') {
+        $stPrecio = $db->prepare("SELECT precio FROM grooming WHERE id=?");
+        $stPrecio->execute([(int)($_POST['id'] ?? 0)]);
+        if ((float)$stPrecio->fetchColumn() <= 0) {
+          http_response_code(422);
+          header('Content-Type: application/json');
+          echo json_encode(['ok'=>false,'error'=>'Completa el precio antes de marcar el servicio como completado.']);
+          exit;
+        }
+      }
       $db->prepare("UPDATE grooming SET estado=? WHERE id=?")->execute([$nuevo,(int)$_POST['id']]);
     }
     header('Content-Type: application/json'); echo json_encode(['ok'=>true]); exit;
@@ -943,7 +953,11 @@ function banoTerminado(id){
   fd.append('id', id);
   fd.append('estado', 'completado');
   fetch(window.location.href, { method:'POST', body:fd })
-    .then(function(){ window.location.reload(); })
+    .then(function(r){ return r.json(); })
+    .then(function(res){
+      if (!res.ok) { alert(res.error || 'No se pudo completar el servicio.'); return; }
+      window.location.reload();
+    })
     .catch(function(){ alert('Error al cambiar estado.'); });
 }
 
