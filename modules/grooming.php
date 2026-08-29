@@ -38,6 +38,13 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
   $pa=$_POST['action']??'';
   if ($pa==='save') {
     $id=(int)($_POST['id']??0);
+    $precio_raw = trim((string)($_POST['precio'] ?? ''));
+    $precio = (float)str_replace(',', '.', $precio_raw);
+    if ($precio_raw === '' || $precio <= 0) {
+      $_SESSION['flash_error'] = 'El precio es obligatorio y debe ser mayor que S/. 0.00.';
+      $url = BASE_URL . '/index.php?p=grooming&action=' . ($id ? 'editar&id=' . $id : 'nuevo');
+      header('Location: ' . $url); exit;
+    }
     $fields=['mascota_id','groomer_id','fecha','duracion_minutos','tipo_servicio','tipo_corte',
              'observaciones','condicion_pelo','alergias_reportadas','productos_usados','precio','metodo_pago','estado','notas_internas'];
     $data=[]; foreach($fields as $f) $data[$f]=trim($_POST[$f]??'')?:null;
@@ -99,6 +106,9 @@ $ei=['perro'=>'🐕','gato'=>'🐈','conejo'=>'🐰','ave'=>'🐦','reptil'=>'�
 $estado_color=['programado'=>'var(--info)','en_proceso'=>'var(--warning)','completado'=>'var(--success)','cancelado'=>'var(--danger)'];
 ?>
 <div class="page">
+<?php if(!empty($_SESSION['flash_error'])): $gr_error=$_SESSION['flash_error']; unset($_SESSION['flash_error']); ?>
+<div class="alert alert-danger"><span class="alert-icon">❌</span><?= clean($gr_error) ?></div>
+<?php endif; ?>
 <?php if($msg==='success'): ?><div class="alert alert-success"><span class="alert-icon">✅</span>Servicio de grooming guardado.</div><?php endif; ?>
 
 <?php if(in_array($action,['nuevo','editar'])): ?>
@@ -180,7 +190,7 @@ $estado_color=['programado'=>'var(--info)','en_proceso'=>'var(--warning)','compl
         </select>
       </div>
       <div class="form-group"><label class="form-label">Precio (S/.)</label>
-        <input class="form-input" type="number" step="0.50" name="precio" value="<?= clean($editing['precio']??'') ?>">
+        <input class="form-input" type="number" step="0.01" min="0.01" name="precio" value="<?= clean($editing['precio']??'') ?>" required>
       </div>
     </div>
     <div class="form-row">
