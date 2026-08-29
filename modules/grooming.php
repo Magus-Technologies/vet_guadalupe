@@ -264,13 +264,13 @@ $ticket = $comp>0 ? $ingresos/$comp : 0;
 
 $q=$db->prepare("SELECT COALESCE(NULLIF(g.metodo_pago,''),'No registrado') mp, COUNT(*) n, SUM(g.precio) monto
   $FROM AND g.estado='completado' GROUP BY mp ORDER BY monto DESC"); $q->execute($P); $MP=$q->fetchAll();
-$q=$db->prepare("SELECT g.tipo_servicio ts, COUNT(*) n, SUM(CASE WHEN g.estado='completado' THEN g.precio ELSE 0 END) monto
+$q=$db->prepare("SELECT g.tipo_servicio ts, COUNT(*) n, SUM(CASE WHEN g.estado<>'cancelado' THEN COALESCE(g.precio,0) ELSE 0 END) monto
   $FROM GROUP BY g.tipo_servicio ORDER BY n DESC"); $q->execute($P); $TS=$q->fetchAll();
-$q=$db->prepare("SELECT u.nombre groomer, COUNT(*) n, SUM(g.estado='completado') comp, SUM(CASE WHEN g.estado='completado' THEN g.precio ELSE 0 END) monto
+$q=$db->prepare("SELECT u.nombre groomer, COUNT(*) n, SUM(g.estado='completado') comp, SUM(CASE WHEN g.estado<>'cancelado' THEN COALESCE(g.precio,0) ELSE 0 END) monto
   $FROM GROUP BY u.id ORDER BY monto DESC, n DESC"); $q->execute($P); $GG=$q->fetchAll();
-$q=$db->prepare("SELECT c.nombre dueno, COUNT(*) n, SUM(CASE WHEN g.estado='completado' THEN g.precio ELSE 0 END) monto
+$q=$db->prepare("SELECT c.nombre dueno, COUNT(*) n, SUM(CASE WHEN g.estado<>'cancelado' THEN COALESCE(g.precio,0) ELSE 0 END) monto
   $FROM GROUP BY c.id ORDER BY n DESC, monto DESC LIMIT 8"); $q->execute($P); $TC=$q->fetchAll();
-$q=$db->prepare("SELECT DATE(g.fecha) d, COUNT(*) n, SUM(CASE WHEN g.estado='completado' THEN g.precio ELSE 0 END) monto
+$q=$db->prepare("SELECT DATE(g.fecha) d, COUNT(*) n, SUM(CASE WHEN g.estado<>'cancelado' THEN COALESCE(g.precio,0) ELSE 0 END) monto
   $FROM GROUP BY DATE(g.fecha) ORDER BY d"); $q->execute($P); $SD=$q->fetchAll();
 
 $mp_icon=['Efectivo'=>'💵','Yape'=>'📲','Plin'=>'💙','Tarjeta'=>'💳','Transferencia'=>'🏦','No registrado'=>'❔'];
@@ -336,6 +336,7 @@ $sd_max = 1; foreach($SD as $r) $sd_max=max($sd_max,(int)$r['n']);
     <div class="rp-kpi"><div class="n" style="color:#f59e0b"><?= (int)($K['prog']??0)+(int)($K['proc']??0) ?></div><div class="l">📅 Pendientes (prog. + en proceso)</div></div>
     <div class="rp-kpi"><div class="n" style="color:#ef4444"><?= (int)($K['canc']??0) ?></div><div class="l">✕ Cancelados</div></div>
   </div>
+  <div class="text-xs text-muted" style="margin:-5px 0 14px">Los ingresos y el ticket promedio consideran solo servicios completados. Los montos de los detalles muestran el valor de servicios no cancelados, incluidos los programados.</div>
 
   <div class="rp-grid">
     <!-- Método de pago -->
@@ -354,7 +355,7 @@ $sd_max = 1; foreach($SD as $r) $sd_max=max($sd_max,(int)$r['n']);
 
     <!-- Tipo de servicio -->
     <div class="rp-card">
-      <h3>🧼 Por tipo de servicio</h3>
+      <h3>🧼 Por tipo de servicio <span style="font-size:10px;font-weight:500;text-transform:none;letter-spacing:0;color:var(--text3)">(valor no cancelado)</span></h3>
       <?php if(empty($TS)): ?><div class="rp-empty">Sin datos en el periodo.</div>
       <?php else: $ts_max=1; foreach($TS as $r)$ts_max=max($ts_max,(int)$r['n']); foreach($TS as $r): ?>
       <div class="rp-row">
@@ -371,7 +372,7 @@ $sd_max = 1; foreach($SD as $r) $sd_max=max($sd_max,(int)$r['n']);
   <div class="rp-grid">
     <!-- Groomers -->
     <div class="rp-card">
-      <h3>✂️ Producción por groomer</h3>
+      <h3>✂️ Producción por groomer <span style="font-size:10px;font-weight:500;text-transform:none;letter-spacing:0;color:var(--text3)">(valor no cancelado)</span></h3>
       <?php if(empty($GG)): ?><div class="rp-empty">Sin datos en el periodo.</div>
       <?php else: $gg_max=1; foreach($GG as $r)$gg_max=max($gg_max,(float)$r['monto']); foreach($GG as $r): ?>
       <div class="rp-row">
@@ -384,7 +385,7 @@ $sd_max = 1; foreach($SD as $r) $sd_max=max($sd_max,(int)$r['n']);
 
     <!-- Top clientes -->
     <div class="rp-card">
-      <h3>👥 Clientes más frecuentes</h3>
+      <h3>👥 Clientes más frecuentes <span style="font-size:10px;font-weight:500;text-transform:none;letter-spacing:0;color:var(--text3)">(valor no cancelado)</span></h3>
       <?php if(empty($TC)): ?><div class="rp-empty">Sin datos en el periodo.</div>
       <?php else: foreach($TC as $r): ?>
       <div class="rp-row">
