@@ -98,8 +98,8 @@ $vac_alerta = $db->query("
   ORDER BY v.proxima_dosis LIMIT 10
 ")->fetchAll();
 
-$tipos_label = ['cita'=>'Confirmación cita','recibo'=>'Recibo','informe'=>'Informe médico','historial'=>'Historial','vacuna'=>'Recordatorio vacuna','recordatorio'=>'Recordatorio cita','receta'=>'Receta médica','grooming'=>'Grooming/Baño','personalizado'=>'Personalizado'];
-$tipos_badge = ['cita'=>'b-blue','recibo'=>'b-teal','informe'=>'b-red','historial'=>'b-gray','vacuna'=>'b-purple','recordatorio'=>'b-amber','receta'=>'b-green','grooming'=>'b-teal','personalizado'=>'b-gray'];
+$tipos_label = ['cita'=>'Confirmación cita','recibo'=>'Recibo/Boleta/Factura','informe'=>'Informe médico','historial'=>'Historial','vacuna'=>'Recordatorio vacuna','recordatorio'=>'Recordatorio cita','receta'=>'Receta médica','grooming_cita'=>'Grooming — Cita','grooming'=>'Grooming — Recojo','personalizado'=>'Personalizado'];
+$tipos_badge = ['cita'=>'b-blue','recibo'=>'b-teal','informe'=>'b-red','historial'=>'b-gray','vacuna'=>'b-purple','recordatorio'=>'b-amber','receta'=>'b-green','grooming_cita'=>'b-blue','grooming'=>'b-teal','personalizado'=>'b-gray'];
 
 // Nombre de la clínica/veterinaria desde configuración (para reemplazar "VetPro")
 $cfg = $db->query("SELECT clave,valor FROM configuracion")->fetchAll(PDO::FETCH_KEY_PAIR);
@@ -145,7 +145,7 @@ foreach ($cfg as $k => $v) {
       <div class="card mb-2">
         <div class="sec-title mb-1">1. Tipo de mensaje</div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px" id="type-grid">
-          <?php foreach(['cita'=>['📅','Confirmación cita'],'recibo'=>['🧾','Recibo/Boleta'],'informe'=>['🏥','Informe médico'],'historial'=>['📋','Historial clínico'],'vacuna'=>['💉','Recordatorio vacuna'],'recordatorio'=>['⏰','Recordatorio cita'],'receta'=>['💊','Receta médica'],'grooming'=>['✂️','Grooming/Baño'],'personalizado'=>['✏️','Personalizado']] as $k=>[$ico,$lbl]): ?>
+          <?php foreach(['cita'=>['📅','Confirmación cita'],'recibo'=>['🧾','Recibo/Boleta/Factura'],'informe'=>['🏥','Informe médico'],'historial'=>['📋','Historial clínico'],'vacuna'=>['💉','Recordatorio vacuna'],'recordatorio'=>['⏰','Recordatorio cita'],'receta'=>['💊','Receta médica'],'grooming_cita'=>['📅','Grooming — Cita'],'grooming'=>['🛁','Grooming — Recojo'],'personalizado'=>['✏️','Personalizado']] as $k=>[$ico,$lbl]): ?>
           <div class="type-card <?= $pre_tipo===$k?'selected':'' ?>" onclick="selectType('<?= $k ?>')" id="tc-<?= $k ?>" style="border:1px solid var(--border);border-radius:8px;padding:12px;cursor:pointer;transition:all .15s;position:relative">
             <div style="position:absolute;top:6px;right:6px;width:16px;height:16px;border-radius:50%;background:var(--wa);display:<?= $pre_tipo===$k?'flex':'none' ?>;align-items:center;justify-content:center;font-size:10px;color:#fff" id="chk-<?= $k ?>">✓</div>
             <div style="font-size:20px;margin-bottom:5px"><?= $ico ?></div>
@@ -197,7 +197,7 @@ foreach ($cfg as $k => $v) {
         <div>
           <div class="form-label">Variables</div>
           <div class="flex flex-wrap gap-1" style="flex-wrap:wrap">
-            <?php foreach(['{clinica}','{nombre_cliente}','{nombre_mascota}','{fecha}','{hora}','{veterinario}','{diagnostico}','{total}','{proxima_vacuna}','{numero_boleta}','{tipo_vacuna}'] as $v): ?>
+            <?php foreach(['{clinica}','{nombre_cliente}','{nombre_mascota}','{fecha}','{hora}','{veterinario}','{servicio}','{precio}','{diagnostico}','{total}','{proxima_vacuna}','{numero_boleta}','{tipo_documento}','{metodo_pago}','{tipo_vacuna}'] as $v): ?>
             <span onclick="insertVar('<?= $v ?>')" style="font-size:11px;background:var(--bg3);border:0.5px solid var(--border2);border-radius:5px;padding:3px 8px;cursor:pointer;color:var(--text2)"><?= $v ?></span>
             <?php endforeach; ?>
           </div>
@@ -253,11 +253,13 @@ foreach ($cfg as $k => $v) {
     $plantillas = [
       ['cita','📅','Confirmación de cita','b-blue', $tpl_final['cita'] ?? ''],
       ['recordatorio','⏰','Recordatorio 24h antes','b-amber', $tpl_final['recordatorio'] ?? ''],
-      ['recibo','🧾','Recibo de venta','b-teal', $tpl_final['recibo'] ?? ''],
+      ['recibo','🧾','Recibo / Boleta / Factura','b-teal', $tpl_final['recibo'] ?? ''],
       ['informe','🏥','Informe médico','b-red', $tpl_final['informe'] ?? ''],
       ['vacuna','💉','Recordatorio de vacuna','b-purple', $tpl_final['vacuna'] ?? ''],
       ['receta','💊','Receta médica','b-green', $tpl_final['receta'] ?? ''],
       ['historial','📋','Resumen historial clínico','b-gray', $tpl_final['historial'] ?? ''],
+      ['grooming_cita','✂️','Grooming — Confirmación de cita','b-blue', $tpl_final['grooming_cita'] ?? ''],
+      ['grooming','🛁','Grooming — Recojo (ya está listo)','b-teal', $tpl_final['grooming'] ?? ''],
       ['personalizado','✏️','Mensaje de bienvenida','b-teal', "🐾 *Bienvenido a {clinica}, {nombre_cliente}!*\n\nNos complace que confíes en nosotros para el cuidado de *{nombre_mascota}* 🐾\n\nEn cualquier consulta o emergencia, escríbenos aquí.\n\n{clinica} — Cuidamos a tus mascotas ❤️"],
     ];
     foreach($plantillas as [$tipo,$ico,$titulo,$badge,$msg]):
@@ -368,13 +370,14 @@ $NC = $nombre_clinica;
 // por el nombre actual de la veterinaria (así sigue actualizándose aunque se guarde).
 $tpl_default = [
   'cita'        => "🐾 *{clinica}*\n\nHola {nombre_cliente} 👋\n\nTe confirmamos tu cita:\n\n📅 *Fecha:* {fecha}\n🕐 *Hora:* {hora}\n🐶 *Paciente:* {nombre_mascota}\n👨‍⚕️ *Veterinario:* {veterinario}\n\nPor favor llega 10 min antes.\n_Responde si necesitas reprogramar._\n\n✅ {clinica} — Cuidamos a tus mascotas",
-  'recibo'      => "🧾 *Boleta {clinica}*\nN° {numero_boleta}\n\nCliente: {nombre_cliente}\nMascota: {nombre_mascota}\nFecha: {fecha}\n\n💰 *Total: S/. {total}*\nMétodo: Yape ✅\n\nGracias por confiar en {clinica} 🐾",
+  'recibo'      => "🧾 *{tipo_documento} {clinica}*\nN° {numero_boleta}\n\nCliente: {nombre_cliente}\nMascota: {nombre_mascota}\nFecha: {fecha}\n\n💰 *Total: S/. {total}*\nMétodo: {metodo_pago} ✅\n\nGracias por confiar en {clinica} 🐾",
   'informe'     => "🏥 *Informe Médico — {clinica}*\n\nPaciente: *{nombre_mascota}*\nDueño: {nombre_cliente}\nFecha: {fecha}\nVet.: {veterinario}\n\n🔍 *Diagnóstico:*\n{diagnostico}\n\n💊 Tratamiento indicado por el veterinario.\n\n{clinica} 🐾",
   'historial'   => "📋 *Historial Clínico — {clinica}*\n\nPaciente: *{nombre_mascota}*\nDueño: {nombre_cliente}\n\n🗓️ *Últimas consultas:*\n• Consulta reciente ✅\n• Vacunas al día ✅\n\nPara historial completo, visítanos o escríbenos.\n\n{clinica} 🐾",
   'vacuna'      => "💉 *Alerta de Vacuna — {clinica}*\n\nHola {nombre_cliente} 👋\n\nLa vacuna de *{nombre_mascota}* vence pronto:\n🗓️ *Vencimiento:* {proxima_vacuna}\n💉 {tipo_vacuna}\n\n👉 Agenda su cita respondiendo este mensaje.\n\n{clinica} 🐾",
   'recordatorio'=> "⏰ *Recordatorio {clinica}*\n\nHola {nombre_cliente} 👋\n\nMañana es la cita de *{nombre_mascota}*:\n📅 {fecha} a las {hora}\n👨‍⚕️ {veterinario}\n\n¿Confirmas tu asistencia?\nResponde *SÍ* o *NO*\n\n{clinica} 🐾",
   'receta'      => "💊 *Receta Médica — {clinica}*\n\nPaciente: *{nombre_mascota}*\nVet.: {veterinario}\nFecha: {fecha}\n\n📋 *Medicamentos:*\n• Amoxicilina 500mg — 1 comp c/12h x 7 días\n• Meloxicam — 1 vez al día con comida x 5 días\n\n{clinica} 🐾",
-  'grooming'    => "✂️ *Grooming — {clinica}*\n\nHola {nombre_cliente} 👋\n\n¡*{nombre_mascota}* ya está listo! 🛁✨\n\n🧼 *Servicio:* {servicio}\n📅 *Fecha:* {fecha}\n🕐 *Hora:* {hora}\n💰 *Total:* S/. {precio}\n\nPuedes pasar a recogerlo cuando gustes.\n\n{clinica} 🐾",
+  'grooming_cita'=> "✂️ *Cita de Grooming — {clinica}*\n\nHola {nombre_cliente} 👋\n\nTe confirmamos la cita de *{nombre_mascota}* 🐾\n\n🧼 *Servicio:* {servicio}\n📅 *Fecha:* {fecha}\n🕐 *Hora:* {hora}\n\nPor favor llega unos minutos antes.\n_Responde si necesitas reprogramar._\n\n{clinica} 🐾",
+  'grooming'    => "🛁 *Grooming — {clinica}*\n\nHola {nombre_cliente} 👋\n\n¡*{nombre_mascota}* ya está listo! 🛁✨\n\n🧼 *Servicio:* {servicio}\n📅 *Fecha:* {fecha}\n🕐 *Hora:* {hora}\n💰 *Total:* S/. {precio}\n\nPuedes pasar a recogerlo cuando gustes.\n\n{clinica} 🐾",
   'personalizado'=> "",
 ];
 // Aplicar encima las plantillas guardadas por el usuario
@@ -389,12 +392,13 @@ var TEMPLATES = <?= json_encode($tpl_final, JSON_UNESCAPED_UNICODE) ?>;
 
 var EXTRA_FIELDS = {
   cita: '<div class="form-row mb-2"><div class="form-group"><label class="form-label">Fecha cita</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div><div class="form-group"><label class="form-label">Hora</label><input class="form-input" id="ef-hora" type="time" value="09:00" oninput="updatePreview()"></div></div><div class="form-row mb-2"><div class="form-group"><label class="form-label">Veterinario</label><select class="form-input" id="ef-vet" onchange="updatePreview()"><?php foreach($veterinarios as $v): ?><option><?= clean($v['nombre']) ?></option><?php endforeach; ?></select></div><div class="form-group"><label class="form-label">Tipo atención</label><select class="form-input" id="ef-tipo" onchange="updatePreview()"><option>Consulta general</option><option>Vacuna</option><option>Control</option><option>Cirugía</option><option>Baño</option></select></div></div>',
-  recibo: '<div class="form-row mb-2"><div class="form-group"><label class="form-label">N° Boleta</label><input class="form-input" id="ef-nro" value="B001-00001" oninput="updatePreview()"></div><div class="form-group"><label class="form-label">Total (S/.)</label><input class="form-input" id="ef-total" type="number" value="0.00" step="0.01" oninput="updatePreview()"></div></div><div class="form-row mb-2"><div class="form-group"><label class="form-label">Método de pago</label><select class="form-input" id="ef-metodo" onchange="updatePreview()"><option>Yape</option><option>Plin</option><option>Efectivo</option><option>Tarjeta</option><option>Transferencia</option></select></div><div class="form-group"><label class="form-label">Fecha</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div></div>',
+  recibo: '<div class="form-row mb-2"><div class="form-group"><label class="form-label">Tipo de documento</label><select class="form-input" id="ef-tipodoc" onchange="tipoDocPrefijo()"><option>Boleta</option><option>Factura</option><option>Recibo</option></select></div><div class="form-group"><label class="form-label">N°</label><input class="form-input" id="ef-nro" value="B001-00001" oninput="updatePreview()"></div></div><div class="form-row mb-2"><div class="form-group"><label class="form-label">Total (S/.)</label><input class="form-input" id="ef-total" type="number" value="0.00" step="0.01" oninput="updatePreview()"></div><div class="form-group"><label class="form-label">Método de pago</label><select class="form-input" id="ef-metodo" onchange="updatePreview()"><option>Yape</option><option>Plin</option><option>Efectivo</option><option>Tarjeta</option><option>Transferencia</option></select></div></div><div class="form-group mb-2"><label class="form-label">Fecha</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div>',
   vacuna: '<div class="form-row mb-2"><div class="form-group"><label class="form-label">Tipo vacuna</label><select class="form-input" id="ef-vacuna" onchange="updatePreview()"><option>Antirrábica</option><option>Óctuple</option><option>Triple Felina</option><option>Mixomatosis</option><option>Parvovirus</option></select></div><div class="form-group"><label class="form-label">Fecha vencimiento</label><input class="form-input" id="ef-proxima" type="date" oninput="updatePreview()"></div></div>',
   informe: '<div class="form-group mb-2"><label class="form-label">Diagnóstico</label><input class="form-input" id="ef-diag" placeholder="Diagnóstico clínico" oninput="updatePreview()"></div><div class="form-row mb-2"><div class="form-group"><label class="form-label">Veterinario</label><select class="form-input" id="ef-vet" onchange="updatePreview()"><?php foreach($veterinarios as $v): ?><option><?= clean($v['nombre']) ?></option><?php endforeach; ?></select></div><div class="form-group"><label class="form-label">Fecha consulta</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div></div>',
   recordatorio: '<div class="form-row mb-2"><div class="form-group"><label class="form-label">Fecha cita</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div><div class="form-group"><label class="form-label">Hora</label><input class="form-input" id="ef-hora" type="time" value="09:00" oninput="updatePreview()"></div></div><div class="form-group mb-2"><label class="form-label">Veterinario</label><select class="form-input" id="ef-vet" onchange="updatePreview()"><?php foreach($veterinarios as $v): ?><option><?= clean($v['nombre']) ?></option><?php endforeach; ?></select></div>',
   receta: '<div class="form-group mb-2"><label class="form-label">Veterinario</label><select class="form-input" id="ef-vet" onchange="updatePreview()"><?php foreach($veterinarios as $v): ?><option><?= clean($v['nombre']) ?></option><?php endforeach; ?></select></div><div class="form-group mb-2"><label class="form-label">Fecha receta</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div>',
   grooming: '<div class="form-group mb-2"><label class="form-label">Servicio</label><select class="form-input" id="ef-servicio" onchange="groomPrecio()"><?php if(empty($serv_groom)): ?><option value="Baño y corte">Baño y corte</option><option value="Baño completo">Baño completo</option><option value="Corte de pelo">Corte de pelo</option><?php else: foreach($serv_groom as $s): ?><option value="<?= clean($s['nombre']) ?>" data-precio="<?= number_format($s['precio'],2,'.','') ?>"><?= clean($s['nombre']) ?> — S/ <?= number_format($s['precio'],2) ?></option><?php endforeach; endif; ?></select></div><div class="form-row mb-2"><div class="form-group"><label class="form-label">Fecha</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div><div class="form-group"><label class="form-label">Hora</label><input class="form-input" id="ef-hora" type="time" value="10:00" oninput="updatePreview()"></div></div><div class="form-group mb-2"><label class="form-label">Precio (S/.)</label><input class="form-input" id="ef-precio" type="number" step="0.01" value="0.00" oninput="updatePreview()"></div>',
+  grooming_cita: '<div class="form-group mb-2"><label class="form-label">Servicio</label><select class="form-input" id="ef-servicio" onchange="groomPrecio()"><?php if(empty($serv_groom)): ?><option value="Baño y corte">Baño y corte</option><option value="Baño completo">Baño completo</option><option value="Corte de pelo">Corte de pelo</option><?php else: foreach($serv_groom as $s): ?><option value="<?= clean($s['nombre']) ?>" data-precio="<?= number_format($s['precio'],2,'.','') ?>"><?= clean($s['nombre']) ?> — S/ <?= number_format($s['precio'],2) ?></option><?php endforeach; endif; ?></select></div><div class="form-row mb-2"><div class="form-group"><label class="form-label">Fecha</label><input class="form-input" id="ef-fecha" type="date" oninput="updatePreview()"></div><div class="form-group"><label class="form-label">Hora</label><input class="form-input" id="ef-hora" type="time" value="10:00" oninput="updatePreview()"></div></div>',
   historial: '',
   personalizado: ''
 };
@@ -443,10 +447,23 @@ function resolveMsg() {
     .replace(/\{diagnostico\}/g, getV('ef-diag') || '[Diagnóstico]')
     .replace(/\{total\}/g, getV('ef-total') || '0.00')
     .replace(/\{numero_boleta\}/g, getV('ef-nro') || 'B001-00001')
+    .replace(/\{tipo_documento\}/g, getV('ef-tipodoc') || 'Boleta')
+    .replace(/\{metodo_pago\}/g, getV('ef-metodo') || 'Yape')
     .replace(/\{proxima_vacuna\}/g, fmtPv)
     .replace(/\{servicio\}/g, getV('ef-servicio') || '[Servicio]')
     .replace(/\{precio\}/g, getV('ef-precio') || '0.00')
     .replace(/\{tipo_vacuna\}/g, getV('ef-vacuna') || 'Vacuna');
+}
+
+// Al cambiar el tipo de documento, ajustar el prefijo sugerido del N° (B/F/RH)
+function tipoDocPrefijo(){
+  var t=document.getElementById('ef-tipodoc'); var n=document.getElementById('ef-nro');
+  if(t&&n){
+    var pref = t.value==='Factura' ? 'F001-00001' : (t.value==='Recibo' ? 'RH01-00001' : 'B001-00001');
+    // Solo autocompleta si el usuario no cambió el valor por defecto
+    if(/^(B001|F001|RH01)-00001$/.test(n.value)) n.value=pref;
+  }
+  updatePreview();
 }
 
 // Al elegir un servicio de grooming, copiar su precio del catálogo

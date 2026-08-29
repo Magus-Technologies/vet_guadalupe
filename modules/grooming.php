@@ -1,6 +1,7 @@
 <?php
 $page = 'grooming'; $pageTitle = 'Grooming / Peluquería';
-require_once __DIR__ . '/../includes/header.php';
+require_once __DIR__ . '/../includes/config.php';
+if (function_exists('requireLogin')) requireLogin();
 $db = getDB();
 
 $db->exec("CREATE TABLE IF NOT EXISTS grooming (
@@ -25,15 +26,20 @@ $db->exec("CREATE TABLE IF NOT EXISTS grooming (
   FOREIGN KEY (groomer_id) REFERENCES usuarios(id)
 )");
 
-$action = $_GET['action'] ?? 'list';
-$msg = '';
+// Self-heal: columna de método de pago (para el reporte)
+try { $db->exec("ALTER TABLE grooming ADD COLUMN IF NOT EXISTS metodo_pago VARCHAR(20) DEFAULT NULL"); } catch (Exception $e) {}
 
+// ─────────────────────────────────────────────────────────────
+// POST ANTES del header: guardar/eliminar responden con REDIRECCIÓN
+// (Post/Redirect/Get) para que al recargar NO se reenvíe el formulario
+// y NO se dupliquen registros. cambiar_estado responde JSON puro.
+// ─────────────────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   $pa=$_POST['action']??'';
   if ($pa==='save') {
     $id=(int)($_POST['id']??0);
     $fields=['mascota_id','groomer_id','fecha','duracion_minutos','tipo_servicio','tipo_corte',
-             'observaciones','condicion_pelo','alergias_reportadas','productos_usados','precio','estado','notas_internas'];
+             'observaciones','condicion_pelo','alergias_reportadas','productos_usados','precio','metodo_pago','estado','notas_internas'];
     $data=[]; foreach($fields as $f) $data[$f]=trim($_POST[$f]??'')?:null;
     if ($id) {
       $sets=implode(',',array_map(fn($f)=>"$f=:$f",$fields));
@@ -42,9 +48,14 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
       $cols=implode(',',$fields); $pls=implode(',',array_map(fn($f)=>":$f",$fields));
       $st=$db->prepare("INSERT INTO grooming ($cols) VALUES ($pls)");
     }
-    $st->execute($data); $msg='success'; $action='list';
+    $st->execute($data);
+    $gid = $id ?: (int)$db->lastInsertId();
+    header('Location: '.BASE_URL.'/index.php?p=grooming&gid='.$gid.'&ok=1'); exit;
   }
-  if ($pa==='delete') { $db->prepare("DELETE FROM grooming WHERE id=?")->execute([(int)$_POST['id']]); $action='list'; }
+  if ($pa==='delete') {
+    $db->prepare("DELETE FROM grooming WHERE id=?")->execute([(int)$_POST['id']]);
+    header('Location: '.BASE_URL.'/index.php?p=grooming'); exit;
+  }
   if ($pa==='cambiar_estado') {
     $estados_ok=['programado','en_proceso','completado','cancelado'];
     $nuevo = $_POST['estado']??'';
@@ -54,6 +65,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     header('Content-Type: application/json'); echo json_encode(['ok'=>true]); exit;
   }
 }
+
+require_once __DIR__ . '/../includes/header.php';
+
+$action = $_GET['action'] ?? 'list';
+$msg = isset($_GET['ok']) ? 'success' : '';
 
 $editing=null;
 if (in_array($action,['editar']) && isset($_GET['id'])) {
@@ -95,7 +111,11 @@ $estado_color=['programado'=>'var(--info)','en_proceso'=>'var(--warning)','compl
     <input type="hidden" name="action" value="save">
     <input type="hidden" name="id" value="<?= $editing['id']??'' ?>">
     <div class="form-row">
-      <div class="form-group" style="position:relative"><label class="form-label required">Mascota</label>
+      <div class="form-group" style="position:relative">
+        <label class="form-label required" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Mascota</span>
+          <a href="javascript:void(0)" onclick="rrAbrir()" style="font-size:11px;font-weight:600;color:var(--primary);text-decoration:none">➕ Registrar nuevo</a>
+        </label>
         <input type="text" id="inp-mas-grm" class="form-input" placeholder="🐾 Buscar mascota..." autocomplete="off">
         <input type="hidden" name="mascota_id" id="hid-mas-grm" value="" required>
         <div id="drop-mas-grm" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--bg2);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.12);z-index:300;max-height:220px;overflow-y:auto"></div>
@@ -163,6 +183,17 @@ $estado_color=['programado'=>'var(--info)','en_proceso'=>'var(--warning)','compl
         <input class="form-input" type="number" step="0.50" name="precio" value="<?= clean($editing['precio']??'') ?>">
       </div>
     </div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Método de pago</label>
+        <select class="form-input" name="metodo_pago">
+          <option value="">— Sin registrar —</option>
+          <?php foreach(['Efectivo','Yape','Plin','Tarjeta','Transferencia'] as $mp): ?>
+          <option value="<?= $mp ?>" <?= ($editing['metodo_pago']??'')===$mp?'selected':'' ?>><?= $mp ?></option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+      <div class="form-group"></div>
+    </div>
     <div class="form-group"><label class="form-label">Alergias reportadas / Piel sensible</label>
       <input class="form-input" name="alergias_reportadas" value="<?= clean($editing['alergias_reportadas']??'') ?>" placeholder="Ej: Alergia a champús con fragancia, piel seca...">
     </div>
@@ -185,6 +216,191 @@ $estado_color=['programado'=>'var(--info)','en_proceso'=>'var(--warning)','compl
     </div>
     <div class="flex gap-2"><button type="submit" class="btn btn-primary">💾 Guardar</button><a href="?p=grooming" class="btn btn-ghost">Cancelar</a></div>
   </form>
+</div>
+
+<?php elseif($action==='reporte'): ?>
+<?php
+// ===================== REPORTE DE GROOMING =====================
+$hoy = date('Y-m-d');
+$preset = $_GET['preset'] ?? 'mes';
+if     ($preset==='mes_ant') { $desde=date('Y-m-01',strtotime('first day of last month')); $hasta=date('Y-m-t',strtotime('last day of last month')); }
+elseif ($preset==='30d')     { $desde=date('Y-m-d',strtotime('-29 days')); $hasta=$hoy; }
+elseif ($preset==='anio')    { $desde=date('Y-01-01'); $hasta=date('Y-12-31'); }
+elseif ($preset==='rango')   { $desde=$_GET['desde']??date('Y-m-01'); $hasta=$_GET['hasta']??$hoy; }
+else   { $preset='mes'; $desde=date('Y-m-01'); $hasta=date('Y-m-t'); }
+if(!preg_match('/^\d{4}-\d{2}-\d{2}$/',$desde)) $desde=date('Y-m-01');
+if(!preg_match('/^\d{4}-\d{2}-\d{2}$/',$hasta)) $hasta=date('Y-m-t');
+
+// Filtro por sede (igual que en la lista)
+$sede_sql='';
+try { $_r=$db->query("SHOW COLUMNS FROM mascotas LIKE 'sede_id'")->fetchAll();
+  if(!empty($_r) && !verTodasSedes()) $sede_sql=" AND m.sede_id=".(int)getSede(); } catch(Exception $e){}
+
+$FROM = "FROM grooming g
+  JOIN mascotas m ON m.id=g.mascota_id
+  JOIN usuarios u ON u.id=g.groomer_id
+  JOIN clientes c ON c.id=m.cliente_id
+  WHERE DATE(g.fecha) BETWEEN ? AND ? $sede_sql";
+$P=[$desde,$hasta];
+
+$q=$db->prepare("SELECT COUNT(*) tot,
+  SUM(g.estado='completado') comp, SUM(g.estado='programado') prog,
+  SUM(g.estado='en_proceso') proc, SUM(g.estado='cancelado') canc,
+  SUM(CASE WHEN g.estado='completado' THEN g.precio ELSE 0 END) ingresos,
+  SUM(CASE WHEN g.estado<>'cancelado' THEN g.precio ELSE 0 END) agendado
+  $FROM"); $q->execute($P); $K=$q->fetch();
+$ingresos=(float)($K['ingresos']??0); $comp=(int)($K['comp']??0); $tot=(int)($K['tot']??0);
+$ticket = $comp>0 ? $ingresos/$comp : 0;
+
+$q=$db->prepare("SELECT COALESCE(NULLIF(g.metodo_pago,''),'No registrado') mp, COUNT(*) n, SUM(g.precio) monto
+  $FROM AND g.estado='completado' GROUP BY mp ORDER BY monto DESC"); $q->execute($P); $MP=$q->fetchAll();
+$q=$db->prepare("SELECT g.tipo_servicio ts, COUNT(*) n, SUM(CASE WHEN g.estado='completado' THEN g.precio ELSE 0 END) monto
+  $FROM GROUP BY g.tipo_servicio ORDER BY n DESC"); $q->execute($P); $TS=$q->fetchAll();
+$q=$db->prepare("SELECT u.nombre groomer, COUNT(*) n, SUM(g.estado='completado') comp, SUM(CASE WHEN g.estado='completado' THEN g.precio ELSE 0 END) monto
+  $FROM GROUP BY u.id ORDER BY monto DESC, n DESC"); $q->execute($P); $GG=$q->fetchAll();
+$q=$db->prepare("SELECT c.nombre dueno, COUNT(*) n, SUM(CASE WHEN g.estado='completado' THEN g.precio ELSE 0 END) monto
+  $FROM GROUP BY c.id ORDER BY n DESC, monto DESC LIMIT 8"); $q->execute($P); $TC=$q->fetchAll();
+$q=$db->prepare("SELECT DATE(g.fecha) d, COUNT(*) n, SUM(CASE WHEN g.estado='completado' THEN g.precio ELSE 0 END) monto
+  $FROM GROUP BY DATE(g.fecha) ORDER BY d"); $q->execute($P); $SD=$q->fetchAll();
+
+$mp_icon=['Efectivo'=>'💵','Yape'=>'📲','Plin'=>'💙','Tarjeta'=>'💳','Transferencia'=>'🏦','No registrado'=>'❔'];
+$periodo_lbl = date('d/m/Y',strtotime($desde)).' – '.date('d/m/Y',strtotime($hasta));
+$sd_max = 1; foreach($SD as $r) $sd_max=max($sd_max,(int)$r['n']);
+?>
+<style>
+.rp-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}
+.rp-kpi{background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
+.rp-kpi .n{font-size:26px;font-weight:800;line-height:1.1}
+.rp-kpi .l{font-size:12px;color:var(--text3);margin-top:4px;font-weight:600}
+.rp-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.rp-card{background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
+.rp-card h3{font-size:13px;font-weight:800;color:var(--text2);text-transform:uppercase;letter-spacing:.4px;margin:0 0 12px;display:flex;align-items:center;gap:7px}
+.rp-row{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--border);font-size:13px}
+.rp-row:last-child{border-bottom:none}
+.rp-row .name{flex:1;min-width:0;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rp-row .n{color:var(--text3);font-size:12px;font-weight:600}
+.rp-row .amt{font-weight:800;color:var(--success);min-width:78px;text-align:right}
+.rp-bar{height:7px;border-radius:999px;background:var(--bg3);overflow:hidden;flex:1.4;max-width:140px}
+.rp-bar>i{display:block;height:100%;border-radius:999px}
+.rp-chart{display:flex;align-items:flex-end;gap:4px;height:120px;padding-top:8px}
+.rp-chart .bar{flex:1;background:#5eead4;border:1px solid #2dd4bf;border-bottom:none;border-radius:4px 4px 0 0;position:relative;min-height:3px;display:flex;align-items:flex-end;justify-content:center}
+.rp-chart .bar:hover{background:#2dd4bf}
+.rp-chart .bar>span{position:absolute;bottom:-18px;font-size:9px;color:var(--text3);white-space:nowrap}
+.rp-empty{text-align:center;padding:36px;color:var(--text3);font-size:13px}
+@media(max-width:820px){ .rp-grid{grid-template-columns:1fr} }
+@media print{ .no-print{display:none!important} .side-nav,.sidebar,.topbar,nav{display:none!important} }
+</style>
+
+<div class="page">
+  <div class="gr-topbar no-print" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:10px">
+    <div>
+      <div class="page-title" style="font-size:18px">📊 Reporte de Grooming</div>
+      <div class="page-desc">Periodo: <strong><?= $periodo_lbl ?></strong></div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <a href="?p=grooming" class="btn btn-ghost btn-sm">← Volver</a>
+      <button onclick="window.print()" class="btn btn-primary btn-sm">🖨️ Imprimir / PDF</button>
+    </div>
+  </div>
+
+  <!-- Selector de periodo -->
+  <div class="no-print" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;align-items:center">
+    <?php foreach(['mes'=>'Este mes','mes_ant'=>'Mes anterior','30d'=>'Últimos 30 días','anio'=>'Este año'] as $pk=>$pl): ?>
+    <a href="?p=grooming&action=reporte&preset=<?= $pk ?>" class="gr-filter-btn <?= $preset===$pk?'active':'' ?>" style="text-decoration:none"><?= $pl ?></a>
+    <?php endforeach; ?>
+    <form method="GET" style="display:flex;gap:6px;align-items:center;margin-left:auto;flex-wrap:wrap">
+      <input type="hidden" name="p" value="grooming"><input type="hidden" name="action" value="reporte"><input type="hidden" name="preset" value="rango">
+      <input type="date" name="desde" value="<?= clean($desde) ?>" class="form-input" style="width:150px;padding:6px 10px">
+      <span style="color:var(--text3)">→</span>
+      <input type="date" name="hasta" value="<?= clean($hasta) ?>" class="form-input" style="width:150px;padding:6px 10px">
+      <button class="btn btn-ghost btn-sm">Aplicar</button>
+    </form>
+  </div>
+
+  <!-- KPIs -->
+  <div class="rp-kpis">
+    <div class="rp-kpi"><div class="n" style="color:var(--primary)"><?= $tot ?></div><div class="l">🛁 Servicios en el periodo</div></div>
+    <div class="rp-kpi"><div class="n" style="color:#10b981"><?= $comp ?></div><div class="l">✅ Completados</div></div>
+    <div class="rp-kpi"><div class="n" style="color:#10b981">S/. <?= number_format($ingresos,2) ?></div><div class="l">💰 Ingresos (completados)</div></div>
+    <div class="rp-kpi"><div class="n" style="color:var(--text)">S/. <?= number_format($ticket,2) ?></div><div class="l">🎫 Ticket promedio</div></div>
+    <div class="rp-kpi"><div class="n" style="color:#f59e0b"><?= (int)($K['prog']??0)+(int)($K['proc']??0) ?></div><div class="l">📅 Pendientes (prog. + en proceso)</div></div>
+    <div class="rp-kpi"><div class="n" style="color:#ef4444"><?= (int)($K['canc']??0) ?></div><div class="l">✕ Cancelados</div></div>
+  </div>
+
+  <div class="rp-grid">
+    <!-- Método de pago -->
+    <div class="rp-card">
+      <h3>💳 Ingresos por método de pago</h3>
+      <?php if(empty($MP)): ?><div class="rp-empty">Sin servicios completados en el periodo.</div>
+      <?php else: $mp_max=1; foreach($MP as $r)$mp_max=max($mp_max,(float)$r['monto']); foreach($MP as $r): ?>
+      <div class="rp-row">
+        <span style="width:22px"><?= $mp_icon[$r['mp']]??'💳' ?></span>
+        <span class="name"><?= clean($r['mp']) ?> <span class="n">· <?= $r['n'] ?></span></span>
+        <span class="rp-bar"><i style="width:<?= max(3,round(100*$r['monto']/$mp_max)) ?>%;background:#10b981"></i></span>
+        <span class="amt">S/. <?= number_format($r['monto'],2) ?></span>
+      </div>
+      <?php endforeach; endif; ?>
+    </div>
+
+    <!-- Tipo de servicio -->
+    <div class="rp-card">
+      <h3>🧼 Por tipo de servicio</h3>
+      <?php if(empty($TS)): ?><div class="rp-empty">Sin datos en el periodo.</div>
+      <?php else: $ts_max=1; foreach($TS as $r)$ts_max=max($ts_max,(int)$r['n']); foreach($TS as $r): ?>
+      <div class="rp-row">
+        <span style="width:22px"><?= $servicio_icons[$r['ts']]??'🐾' ?></span>
+        <span class="name"><?= $servicio_labels[$r['ts']]??ucfirst($r['ts']) ?></span>
+        <span class="rp-bar"><i style="width:<?= max(3,round(100*$r['n']/$ts_max)) ?>%;background:#0ea5a4"></i></span>
+        <span class="n" style="min-width:34px;text-align:right"><?= $r['n'] ?></span>
+        <span class="amt">S/. <?= number_format($r['monto'],2) ?></span>
+      </div>
+      <?php endforeach; endif; ?>
+    </div>
+  </div>
+
+  <div class="rp-grid">
+    <!-- Groomers -->
+    <div class="rp-card">
+      <h3>✂️ Producción por groomer</h3>
+      <?php if(empty($GG)): ?><div class="rp-empty">Sin datos en el periodo.</div>
+      <?php else: $gg_max=1; foreach($GG as $r)$gg_max=max($gg_max,(float)$r['monto']); foreach($GG as $r): ?>
+      <div class="rp-row">
+        <span class="name"><?= clean($r['groomer']) ?> <span class="n">· <?= $r['comp'] ?>/<?= $r['n'] ?> compl.</span></span>
+        <span class="rp-bar"><i style="width:<?= max(3,round(100*$r['monto']/$gg_max)) ?>%;background:#8b5cf6"></i></span>
+        <span class="amt">S/. <?= number_format($r['monto'],2) ?></span>
+      </div>
+      <?php endforeach; endif; ?>
+    </div>
+
+    <!-- Top clientes -->
+    <div class="rp-card">
+      <h3>👥 Clientes más frecuentes</h3>
+      <?php if(empty($TC)): ?><div class="rp-empty">Sin datos en el periodo.</div>
+      <?php else: foreach($TC as $r): ?>
+      <div class="rp-row">
+        <span class="name"><?= clean($r['dueno']) ?></span>
+        <span class="n" style="min-width:60px;text-align:right"><?= $r['n'] ?> servicio<?= $r['n']!=1?'s':'' ?></span>
+        <span class="amt">S/. <?= number_format($r['monto'],2) ?></span>
+      </div>
+      <?php endforeach; endif; ?>
+    </div>
+  </div>
+
+  <!-- Actividad diaria -->
+  <div class="rp-card" style="margin-bottom:14px">
+    <h3>📈 Actividad diaria (servicios por día)</h3>
+    <?php if(empty($SD)): ?><div class="rp-empty">Sin actividad en el periodo.</div>
+    <?php else: ?>
+    <div class="rp-chart">
+      <?php foreach($SD as $r): $h=round(100*$r['n']/$sd_max); ?>
+      <div class="bar" style="height:<?= max(3,$h) ?>%" title="<?= date('d/m',strtotime($r['d'])) ?>: <?= $r['n'] ?> servicio(s), S/. <?= number_format($r['monto'],2) ?>">
+        <span><?= date('d/m',strtotime($r['d'])) ?></span>
+      </div>
+      <?php endforeach; ?>
+    </div>
+    <div style="margin-top:26px;font-size:11px;color:var(--text3)">Pasa el cursor sobre cada barra para ver el detalle del día.</div>
+    <?php endif; ?>
+  </div>
 </div>
 
 <?php else: ?>
@@ -246,9 +462,9 @@ if (!$groom_sel && !empty($all_groomings)) {
 ?>
 
 <style>
-.gr-layout { display:grid; grid-template-columns:320px 1fr; gap:0; height:calc(100vh - 130px); background:var(--bg2); border:1px solid var(--border); border-radius:16px; overflow:hidden; }
+.gr-layout { display:grid; grid-template-columns:320px 1fr; gap:0; align-items:start; min-height:420px; background:var(--bg2); border:1px solid var(--border); border-radius:16px; overflow:hidden; }
 /* Lista izquierda */
-.gr-list { border-right:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; }
+.gr-list { border-right:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; max-height:calc(100vh - 175px); }
 .gr-list-head { padding:14px 16px; border-bottom:1px solid var(--border); flex-shrink:0; background:var(--bg2); }
 .gr-search { display:flex; align-items:center; gap:8px; background:var(--bg3); border:1.5px solid var(--border); border-radius:8px; padding:7px 12px; }
 .gr-search input { border:none; background:transparent; outline:none; font-size:12px; color:var(--text); width:100%; font-family:var(--font); }
@@ -276,7 +492,10 @@ if (!$groom_sel && !empty($all_groomings)) {
 .gr-estado-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:3px; }
 
 /* Panel detalle derecho */
-.gr-detail { overflow-y:auto; display:flex; flex-direction:column; }
+.gr-detail { display:flex; flex-direction:column; }
+/* Barra de acciones (siempre visible, debajo del encabezado) */
+.gr-actions-bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; padding:13px 24px; border-bottom:1px solid var(--border); background:var(--bg2); }
+.gr-act-primary { background:#10b981; border-color:#10b981; color:#fff; font-weight:700; }
 .gr-det-head { padding:20px 24px; border-bottom:1px solid var(--border); flex-shrink:0; }
 .gr-det-body { padding:20px 24px; flex:1; overflow-y:auto; }
 .gr-det-grid { display:grid; grid-template-columns:1fr 1fr; gap:0; margin-bottom:16px; }
@@ -300,8 +519,38 @@ if (!$groom_sel && !empty($all_groomings)) {
 /* Cambio de estado rápido */
 .gr-estado-btns { display:flex; gap:6px; flex-wrap:wrap; }
 .gr-est-btn { padding:6px 14px; border-radius:999px; font-size:11px; font-weight:700; border:1.5px solid; cursor:pointer; background:transparent; font-family:var(--font); transition:all .15s; }
+
+/* Botón "Volver a la lista" — solo visible en móvil */
+.gr-back-btn { display:none; align-items:center; gap:6px; font-size:13px; font-weight:700; color:var(--primary); background:var(--bg3); border:1px solid var(--border); border-radius:9px; padding:10px 14px; margin:14px 16px 0; text-decoration:none; width:calc(100% - 32px); box-sizing:border-box; }
+
+/* ─────────── RESPONSIVE MÓVIL / TABLET ─────────── */
+@media (max-width:860px) {
+  /* Stats en 2 columnas */
+  .gr-stats { grid-template-columns:repeat(2,1fr)!important; gap:10px!important; }
+  /* El master-detail deja de ser rígido: se apila y crece con el contenido */
+  .gr-layout { display:block!important; height:auto!important; border:none!important; border-radius:0!important; background:transparent!important; overflow:visible!important; }
+  .gr-list { border-right:none!important; border:1px solid var(--border); border-radius:14px; overflow:hidden; max-height:none!important; }
+  .gr-scroll { overflow:visible!important; }
+  .gr-detail { border:1px solid var(--border); border-radius:14px; overflow:hidden; height:auto; }
+  .gr-det-body { overflow:visible!important; }
+  .gr-det-grid { grid-template-columns:1fr!important; gap:0!important; }
+  .gr-det-grid > .gr-det-box:first-child { padding-right:0!important; padding-bottom:14px; border-bottom:1px solid var(--border); margin-bottom:14px; }
+  .gr-det-grid > .gr-det-box:last-child { border-left:none!important; padding-left:0!important; }
+  .gr-det-val { max-width:60%; }
+  .gr-actions-bar { padding:12px 16px; }
+  .gr-actions-bar .btn { flex:1 1 42%; justify-content:center; }
+  .gr-actions-bar form { margin-left:0!important; flex:1 1 42%; }
+  .gr-actions-bar form .btn { width:100%; }
+  /* Alternancia lista ⇄ detalle (tipo app) */
+  .gr-wrap.show-detail .gr-stats,
+  .gr-wrap.show-detail .gr-topbar,
+  .gr-wrap.show-detail .gr-list { display:none!important; }
+  .gr-wrap.show-list .gr-detail { display:none!important; }
+  .gr-back-btn { display:flex; }
+}
 </style>
 
+<div class="gr-wrap <?= isset($_GET['gid'])?'show-detail':'show-list' ?>">
 <!-- Stats -->
 <div class="gr-stats" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px">
   <?php foreach(['programado'=>['icon'=>'📅','label'=>'Programados','col'=>'#3b82f6'],'en_proceso'=>['icon'=>'✂️','label'=>'En proceso','col'=>'#f59e0b'],'completado'=>['icon'=>'✅','label'=>'Completados','col'=>'#10b981'],'cancelado'=>['icon'=>'✕','label'=>'Cancelados','col'=>'#ef4444']] as $k=>$v): ?>
@@ -313,12 +562,15 @@ if (!$groom_sel && !empty($all_groomings)) {
 </div>
 
 <!-- Barra superior -->
-<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+<div class="gr-topbar" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
   <div>
     <div class="page-title" style="font-size:18px">✨ Grooming / Peluquería</div>
     <div class="page-desc"><?= count($all_groomings) ?> servicios registrados</div>
   </div>
-  <a href="?p=grooming&action=nuevo" class="btn btn-primary">＋ Agendar Servicio</a>
+  <div style="display:flex;gap:8px">
+    <a href="?p=grooming&action=reporte" class="btn btn-ghost">📊 Reporte</a>
+    <a href="?p=grooming&action=nuevo" class="btn btn-primary">＋ Agendar Servicio</a>
+  </div>
 </div>
 
 <!-- LAYOUT 2 COLUMNAS -->
@@ -416,21 +668,27 @@ if (!$groom_sel && !empty($all_groomings)) {
                ? BASE_URL.'/public/uploads/'.$groom_sel['foto_mascota'] : null;
       $tel_det = preg_replace('/[^0-9]/','',ltrim($groom_sel['telefono'],'+'));
       if(strlen($tel_det)<11) $tel_det='51'.$tel_det;
-      // Mensaje de WhatsApp: usa la plantilla EDITABLE del módulo WhatsApp (Grooming/Baño)
-      $wa_clinica = 'VetPro'; $wa_tpl = '';
+      // Mensajes de WhatsApp: usan las plantillas EDITABLES del módulo WhatsApp.
+      //  - wa_tpl_grooming_cita  → confirmación de la cita de grooming
+      //  - wa_tpl_grooming       → aviso de recojo ("ya está listo")
+      $wa_clinica = 'VetPro'; $wa_tpl = ''; $wa_tpl_cita = '';
       try {
-        $_cfg = $db->query("SELECT clave,valor FROM configuracion WHERE clave IN ('nombre_clinica','clinica_nombre','wa_tpl_grooming')")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $_cfg = $db->query("SELECT clave,valor FROM configuracion WHERE clave IN ('nombre_clinica','clinica_nombre','wa_tpl_grooming','wa_tpl_grooming_cita')")->fetchAll(PDO::FETCH_KEY_PAIR);
         foreach (['nombre_clinica','clinica_nombre'] as $_k) {
           if (!empty(trim($_cfg[$_k] ?? ''))) { $wa_clinica = trim($_cfg[$_k]); break; }
         }
-        $wa_tpl = trim($_cfg['wa_tpl_grooming'] ?? '');
+        $wa_tpl      = trim($_cfg['wa_tpl_grooming'] ?? '');
+        $wa_tpl_cita = trim($_cfg['wa_tpl_grooming_cita'] ?? '');
       } catch (Exception $e) {}
       if ($wa_tpl === '') {
-        $wa_tpl = "✂️ *Grooming — {clinica}*\n\nHola {nombre_cliente} 👋\n\n¡*{nombre_mascota}* ya está listo! 🛁✨\n\n🧼 *Servicio:* {servicio}\n📅 *Fecha:* {fecha}\n🕐 *Hora:* {hora}\n💰 *Total:* S/. {precio}\n\nPuedes pasar a recogerlo cuando gustes.\n\n{clinica} 🐾";
+        $wa_tpl = "🛁 *Grooming — {clinica}*\n\nHola {nombre_cliente} 👋\n\n¡*{nombre_mascota}* ya está listo! 🛁✨\n\n🧼 *Servicio:* {servicio}\n📅 *Fecha:* {fecha}\n🕐 *Hora:* {hora}\n💰 *Total:* S/. {precio}\n\nPuedes pasar a recogerlo cuando gustes.\n\n{clinica} 🐾";
+      }
+      if ($wa_tpl_cita === '') {
+        $wa_tpl_cita = "✂️ *Cita de Grooming — {clinica}*\n\nHola {nombre_cliente} 👋\n\nTe confirmamos la cita de *{nombre_mascota}* 🐾\n\n🧼 *Servicio:* {servicio}\n📅 *Fecha:* {fecha}\n🕐 *Hora:* {hora}\n\nPor favor llega unos minutos antes.\n_Responde si necesitas reprogramar._\n\n{clinica} 🐾";
       }
       $_serv_txt = ($servicio_labels[$groom_sel['tipo_servicio']] ?? $groom_sel['tipo_servicio'])
                  . (!empty($groom_sel['tipo_corte']) ? ' — '.$groom_sel['tipo_corte'] : '');
-      $wa_msg = strtr($wa_tpl, [
+      $_wa_map = [
         '{clinica}'        => $wa_clinica,
         '{veterinaria}'    => $wa_clinica,
         '{nombre_cliente}' => (string)$groom_sel['dueno'],
@@ -440,7 +698,14 @@ if (!$groom_sel && !empty($all_groomings)) {
         '{hora}'           => date('H:i', strtotime($groom_sel['fecha'])),
         '{precio}'         => number_format((float)($groom_sel['precio'] ?? 0), 2),
         '{veterinario}'    => (string)($groom_sel['groomer'] ?? ''),
-      ]);
+      ];
+      $wa_msg      = strtr($wa_tpl, $_wa_map);       // recojo ("ya está listo")
+      $wa_msg_cita = strtr($wa_tpl_cita, $_wa_map);  // confirmación de cita
+      // URLs de WhatsApp Web. Solo si el teléfono tiene dígitos suficientes.
+      $_tel_raw     = preg_replace('/[^0-9]/', '', (string)($groom_sel['telefono'] ?? ''));
+      $_tel_ok      = (strlen($_tel_raw) >= 6);
+      $wa_url_listo = $_tel_ok ? 'https://wa.me/'.$tel_det.'?text='.rawurlencode($wa_msg) : '';
+      $wa_url_cita  = $_tel_ok ? 'https://wa.me/'.$tel_det.'?text='.rawurlencode($wa_msg_cita) : '';
       $estado_cfg_det = [
         'programado'  => ['bg'=>'#dbeafe','color'=>'#1e3a8a','icon'=>'📅'],
         'en_proceso'  => ['bg'=>'#fef3c7','color'=>'#78350f','icon'=>'✂️'],
@@ -451,7 +716,10 @@ if (!$groom_sel && !empty($all_groomings)) {
     ?>
     <?php
       $banner_col = ['programado'=>'#3b82f6','en_proceso'=>'#f59e0b','completado'=>'#10b981','cancelado'=>'#ef4444'][$groom_sel['estado']] ?? '#3b82f6';
+      $back_url = '?p=grooming'.($filtro_estado?'&estado='.urlencode($filtro_estado):'').($filtro_q?'&q='.urlencode($filtro_q):'');
     ?>
+    <!-- Volver a la lista (solo móvil) -->
+    <a href="<?= $back_url ?>" class="gr-back-btn">← Volver a la lista</a>
     <!-- BANNER del servicio -->
     <div class="gr-det-head" style="background:<?= $banner_col ?>12;border-bottom:3px solid <?= $banner_col ?>">
       <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
@@ -498,6 +766,26 @@ if (!$groom_sel && !empty($all_groomings)) {
       </div>
     </div>
 
+    <!-- ACCIONES (siempre visibles, debajo del encabezado) -->
+    <div class="gr-actions-bar">
+      <?php if(!in_array($groom_sel['estado'],['completado','cancelado'])): ?>
+      <button type="button" onclick="banoTerminado(<?= (int)$groom_sel['id'] ?>)" class="btn btn-sm gr-act-primary">🛁 Baño terminado + avisar</button>
+      <?php if($wa_url_cita): ?><a href="<?= $wa_url_cita ?>" target="_blank" class="btn btn-wa btn-sm">📅 Confirmar cita</a><?php endif; ?>
+      <?php else: ?>
+      <button type="button" onclick="avisarListo()" class="btn btn-wa btn-sm">💬 Avisar que ya está listo</button>
+      <?php endif; ?>
+      <a href="?p=grooming&action=editar&id=<?= $groom_sel['id'] ?>" class="btn btn-primary btn-sm">✏️ Editar</a>
+      <a href="?p=mascotas&action=ver&id=<?= $groom_sel['mascota_id'] ?>" class="btn btn-ghost btn-sm">🐾 Ficha</a>
+      <a href="?p=historial&mascota_id=<?= $groom_sel['mascota_id'] ?>" class="btn btn-ghost btn-sm">🏥 Historia</a>
+      <a href="https://wa.me/<?= $tel_det ?>" target="_blank" class="btn btn-ghost btn-sm">💬 Chat</a>
+      <form method="POST" style="display:inline;margin-left:auto">
+        <input type="hidden" name="action" value="delete">
+        <input type="hidden" name="id" value="<?= $groom_sel['id'] ?>">
+        <button type="submit" class="btn btn-ghost btn-sm" style="color:var(--danger)"
+                onclick="return confirm('¿Eliminar este servicio de grooming?')">🗑️ Eliminar</button>
+      </form>
+    </div>
+
     <!-- Cuerpo del detalle -->
     <div class="gr-det-body">
 
@@ -516,6 +804,7 @@ if (!$groom_sel && !empty($all_groomings)) {
           <?php if ($groom_sel['precio'] > 0): ?>
           <div class="gr-det-row"><span class="gr-det-lbl">Precio</span><span class="gr-det-val" style="color:var(--success);font-size:14px">S/. <?= number_format($groom_sel['precio'],2) ?></span></div>
           <?php endif; ?>
+          <div class="gr-det-row"><span class="gr-det-lbl">Método de pago</span><span class="gr-det-val"><?= !empty($groom_sel['metodo_pago']) ? '💳 '.clean($groom_sel['metodo_pago']) : '<span style="color:var(--text3);font-weight:500">—</span>' ?></span></div>
         </div>
         <!-- Info del cliente/mascota -->
         <div class="gr-det-box">
@@ -571,19 +860,15 @@ if (!$groom_sel && !empty($all_groomings)) {
 
     </div>
 
-    <!-- Barra de acciones -->
-    <div class="gr-bottom-bar">
-      <a href="?p=grooming&action=editar&id=<?= $groom_sel['id'] ?>" class="btn btn-primary btn-sm">✏️ Editar servicio</a>
-      <a href="?p=mascotas&action=ver&id=<?= $groom_sel['mascota_id'] ?>" class="btn btn-ghost btn-sm">🐾 Ver ficha mascota</a>
-      <a href="?p=historial&mascota_id=<?= $groom_sel['mascota_id'] ?>" class="btn btn-ghost btn-sm">🏥 Historia clínica</a>
-      <a href="https://wa.me/<?= $tel_det ?>?text=<?= rawurlencode($wa_msg) ?>" target="_blank" class="btn btn-wa btn-sm" style="margin-left:auto">💬 WhatsApp</a>
-      <form method="POST" style="display:inline">
-        <input type="hidden" name="action" value="delete">
-        <input type="hidden" name="id" value="<?= $groom_sel['id'] ?>">
-        <button type="submit" class="btn btn-ghost btn-sm" style="color:var(--danger)"
-                onclick="return confirm('¿Eliminar este servicio de grooming?')">🗑️ Eliminar</button>
-      </form>
-    </div>
+    <script>
+    // Datos del servicio seleccionado para el aviso por WhatsApp ("mascota lista")
+    window.GR_WA = {
+      id: <?= (int)$groom_sel['id'] ?>,
+      url: <?= json_encode($wa_url_listo, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>,
+      mascota: <?= json_encode((string)$groom_sel['mascota'], JSON_UNESCAPED_UNICODE) ?>,
+      dueno: <?= json_encode((string)$groom_sel['dueno'], JSON_UNESCAPED_UNICODE) ?>
+    };
+    </script>
 
     <?php else: ?>
     <div class="gr-empty">
@@ -596,6 +881,7 @@ if (!$groom_sel && !empty($all_groomings)) {
   </div>
 
 </div><!-- fin gr-layout -->
+</div><!-- fin gr-wrap -->
 
 <?php endif; ?>
 </div>
@@ -619,15 +905,42 @@ function setFilter(estado) {
 }
 
 async function cambiarEstado(id, estado) {
+  // Si se marca "completado", usar el flujo que además ofrece avisar por WhatsApp
+  if (estado === 'completado') { banoTerminado(id); return; }
   try {
     const fd = new FormData();
     fd.append('action', 'cambiar_estado');
     fd.append('id', id);
     fd.append('estado', estado);
-    const r = await fetch(window.location.href, { method:'POST', body:fd });
-    // Recargar para reflejar cambio
+    await fetch(window.location.href, { method:'POST', body:fd });
     window.location.reload();
   } catch(e) { alert('Error al cambiar estado.'); }
+}
+
+// Marca el servicio como completado (baño terminado) y ofrece avisar al dueño por WhatsApp.
+// La ventana de WhatsApp se abre DENTRO del clic para que el navegador no la bloquee.
+function banoTerminado(id){
+  var G = window.GR_WA || {};
+  var puedeAvisar = G.url && String(G.id) === String(id);
+  var enviar = false;
+  if (puedeAvisar) {
+    enviar = confirm('✅ Baño terminado.\n\n¿Avisar por WhatsApp a ' + (G.dueno||'el dueño') + ' que ' + (G.mascota||'la mascota') + ' ya está listo/a?');
+  }
+  if (enviar) { window.open(G.url, '_blank'); }
+  var fd = new FormData();
+  fd.append('action', 'cambiar_estado');
+  fd.append('id', id);
+  fd.append('estado', 'completado');
+  fetch(window.location.href, { method:'POST', body:fd })
+    .then(function(){ window.location.reload(); })
+    .catch(function(){ alert('Error al cambiar estado.'); });
+}
+
+// Solo abre WhatsApp con el aviso (para servicios ya completados).
+function avisarListo(){
+  var G = window.GR_WA || {};
+  if (G.url) { window.open(G.url, '_blank'); }
+  else { alert('Este cliente no tiene un teléfono válido registrado.'); }
 }
 
 function updateServUI(){
@@ -678,4 +991,5 @@ document.addEventListener('DOMContentLoaded',function(){
     vetSearchSelect('inp-grm-grm','drop-grm-grm','hid-grm-grm',_G,'label');
 });
 </script>
+<?php $RR_HID='hid-mas-grm'; $RR_INP='inp-mas-grm'; include __DIR__ . '/../includes/registro_rapido_modal.php'; ?>
 <?php require_once __DIR__ . '/../includes/footer.php'; ?>

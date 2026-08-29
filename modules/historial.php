@@ -419,7 +419,10 @@ if ($action==='nueva'): ?>
       ?>
       <div class="form-row">
         <div class="form-group" style="position:relative">
-          <label class="form-label required">Paciente</label>
+          <label class="form-label required" style="display:flex;align-items:center;justify-content:space-between">
+            <span>Paciente</span>
+            <a href="javascript:void(0)" onclick="rrAbrir()" style="font-size:11px;font-weight:600;color:var(--primary);text-decoration:none">➕ Registrar nuevo</a>
+          </label>
           <input type="text" id="inp-mas-hc" class="form-input" placeholder="🐾 Buscar mascota..."
                  value="<?= $mascota_pre?clean($mascota_pre['nombre'].' ('.$mascota_pre['dueno'].')'):'' ?>"
                  autocomplete="off">
@@ -786,6 +789,7 @@ function hcToggleVacuna(){
 }
 </script>
 
+<?php $RR_HID='hid-mas-hc'; $RR_INP='inp-mas-hc'; include __DIR__ . '/../includes/registro_rapido_modal.php'; ?>
 <?php
     require_once __DIR__ . '/../includes/footer.php';
     return;
@@ -824,6 +828,13 @@ if ($mascota_id) {
         $vq=$db->prepare("SELECT v.*,u.nombre as veterinario FROM vacunas v LEFT JOIN usuarios u ON u.id=v.veterinario_id WHERE v.mascota_id=? ORDER BY v.fecha_aplicacion DESC, v.id DESC");
         $vq->execute([$mascota_id]); $vacunas_hc=$vq->fetchAll();
     } catch(Exception $e){ $vacunas_hc=[]; }
+}
+// ── Exámenes, Cirugías y Recetas de la mascota (para sus pestañas) ──
+$examenes_hc = $cirugias_hc = $recetas_hc = [];
+if ($mascota_id) {
+    try { $eq=$db->prepare("SELECT e.*,u.nombre as veterinario FROM examenes_auxiliares e LEFT JOIN usuarios u ON u.id=e.veterinario_id WHERE e.mascota_id=? ORDER BY e.fecha DESC, e.id DESC"); $eq->execute([$mascota_id]); $examenes_hc=$eq->fetchAll(); } catch(Exception $e){ $examenes_hc=[]; }
+    try { $cq=$db->prepare("SELECT c.*,u.nombre as veterinario FROM cirugias c LEFT JOIN usuarios u ON u.id=c.veterinario_id WHERE c.mascota_id=? ORDER BY c.fecha_programada DESC, c.id DESC"); $cq->execute([$mascota_id]); $cirugias_hc=$cq->fetchAll(); } catch(Exception $e){ $cirugias_hc=[]; }
+    try { $rq=$db->prepare("SELECT r.*,u.nombre as veterinario,(SELECT GROUP_CONCAT(ri.medicamento SEPARATOR ', ') FROM receta_items ri WHERE ri.receta_id=r.id) as medicamentos FROM recetas r LEFT JOIN usuarios u ON u.id=r.veterinario_id WHERE r.mascota_id=? ORDER BY r.fecha DESC, r.id DESC"); $rq->execute([$mascota_id]); $recetas_hc=$rq->fetchAll(); } catch(Exception $e){ $recetas_hc=[]; }
 }
 // Consulta seleccionada para el panel de detalle
 $consulta_sel=null; $receta_sel=[]; $archivos_sel=[];
@@ -1241,6 +1252,65 @@ $espcol_pac=['perro'=>'#10b981','gato'=>'#6366f1','conejo'=>'#f59e0b','ave'=>'#3
         <div style="text-align:center;padding:12px">
           <a href="?p=vacunas<?= $mascota_id?'&mascota_id='.$mascota_id:'' ?>" style="font-size:11px;color:var(--primary);font-weight:600;text-decoration:none">Ir al módulo Vacunación →</a>
         </div>
+
+      <?php elseif($tab_act==='examenes'): $mes_abr=['01'=>'ENE','02'=>'FEB','03'=>'MAR','04'=>'ABR','05'=>'MAY','06'=>'JUN','07'=>'JUL','08'=>'AGO','09'=>'SEP','10'=>'OCT','11'=>'NOV','12'=>'DIC']; ?>
+        <?php if(empty($examenes_hc)): ?>
+        <div class="hc-empty-small"><div style="font-size:32px;margin-bottom:8px;opacity:.3">🔬</div><div style="font-size:12px">Sin exámenes registrados</div>
+          <?php if($mascota_id): ?><a href="?p=examenes&action=nuevo&mascota_id=<?= $mascota_id ?>" class="btn btn-primary btn-xs" style="margin-top:10px">+ Nuevo examen</a><?php endif; ?>
+        </div>
+        <?php else:
+          $est_ex=['pendiente'=>['Pendiente','#fef3c7','#b45309'],'resultado_parcial'=>['Parcial','#dbeafe','#1e3a8a'],'completado'=>['Completado','#dcfce7','#15803d']];
+          foreach($examenes_hc as $ex): $fx=strtotime($ex['fecha']); $eb=$est_ex[$ex['estado']??'pendiente']??['—','#f1f5f9','#64748b']; ?>
+        <div class="hc-item" style="cursor:default">
+          <div class="hc-dot" style="background:#8b5cf6"></div>
+          <div class="hc-fecha-col"><div class="hc-dia"><?= date('d',$fx) ?></div><div class="hc-mes"><?= $mes_abr[date('m',$fx)]??date('M',$fx) ?></div><div class="hc-anio"><?= date('Y',$fx) ?></div></div>
+          <div class="hc-item-body">
+            <div class="hc-item-tipo">🔬 <?= clean($ex['nombre']) ?> <span class="badge" style="background:<?= $eb[1] ?>;color:<?= $eb[2] ?>;font-size:9px;padding:1px 7px;border-radius:999px;margin-left:4px"><?= $eb[0] ?></span></div>
+            <div class="hc-item-diag"><?= clean(ucfirst($ex['tipo'])) ?><?= !empty($ex['laboratorio'])?' · '.clean($ex['laboratorio']):'' ?></div>
+            <div class="hc-item-vet"><?= $ex['veterinario']?'Dr/a. '.clean($ex['veterinario']):'' ?></div>
+          </div>
+        </div>
+        <?php endforeach; endif; ?>
+        <div style="text-align:center;padding:12px"><a href="?p=examenes<?= $mascota_id?'&mascota_id='.$mascota_id:'' ?>" style="font-size:11px;color:var(--primary);font-weight:600;text-decoration:none">Ir al módulo Exámenes →</a></div>
+
+      <?php elseif($tab_act==='cirugias'): $mes_abr=['01'=>'ENE','02'=>'FEB','03'=>'MAR','04'=>'ABR','05'=>'MAY','06'=>'JUN','07'=>'JUL','08'=>'AGO','09'=>'SEP','10'=>'OCT','11'=>'NOV','12'=>'DIC']; ?>
+        <?php if(empty($cirugias_hc)): ?>
+        <div class="hc-empty-small"><div style="font-size:32px;margin-bottom:8px;opacity:.3">✂️</div><div style="font-size:12px">Sin cirugías registradas</div>
+          <?php if($mascota_id): ?><a href="?p=cirugias&action=nueva&mascota_id=<?= $mascota_id ?>" class="btn btn-primary btn-xs" style="margin-top:10px">+ Nueva cirugía</a><?php endif; ?>
+        </div>
+        <?php else:
+          $est_ci=['programada'=>['Programada','#dbeafe','#1e3a8a'],'en_curso'=>['En curso','#fef3c7','#b45309'],'completada'=>['Completada','#dcfce7','#15803d'],'cancelada'=>['Cancelada','#fee2e2','#b91c1c'],'pospuesta'=>['Pospuesta','#f1f5f9','#64748b']];
+          foreach($cirugias_hc as $ci): $fc=strtotime($ci['fecha_programada']); $cb=$est_ci[$ci['estado']??'programada']??['—','#f1f5f9','#64748b']; ?>
+        <div class="hc-item" style="cursor:default">
+          <div class="hc-dot" style="background:#ef4444"></div>
+          <div class="hc-fecha-col"><div class="hc-dia"><?= date('d',$fc) ?></div><div class="hc-mes"><?= $mes_abr[date('m',$fc)]??date('M',$fc) ?></div><div class="hc-anio"><?= date('Y',$fc) ?></div></div>
+          <div class="hc-item-body">
+            <div class="hc-item-tipo">✂️ <?= clean($ci['tipo_cirugia']) ?> <span class="badge" style="background:<?= $cb[1] ?>;color:<?= $cb[2] ?>;font-size:9px;padding:1px 7px;border-radius:999px;margin-left:4px"><?= $cb[0] ?></span></div>
+            <div class="hc-item-diag"><?= !empty($ci['descripcion'])?clean(substr($ci['descripcion'],0,42)):'—' ?></div>
+            <div class="hc-item-vet"><?= $ci['veterinario']?'Dr/a. '.clean($ci['veterinario']):'' ?></div>
+          </div>
+        </div>
+        <?php endforeach; endif; ?>
+        <div style="text-align:center;padding:12px"><a href="?p=cirugias<?= $mascota_id?'&mascota_id='.$mascota_id:'' ?>" style="font-size:11px;color:var(--primary);font-weight:600;text-decoration:none">Ir al módulo Cirugías →</a></div>
+
+      <?php elseif($tab_act==='recetas'): $mes_abr=['01'=>'ENE','02'=>'FEB','03'=>'MAR','04'=>'ABR','05'=>'MAY','06'=>'JUN','07'=>'JUL','08'=>'AGO','09'=>'SEP','10'=>'OCT','11'=>'NOV','12'=>'DIC']; ?>
+        <?php if(empty($recetas_hc)): ?>
+        <div class="hc-empty-small"><div style="font-size:32px;margin-bottom:8px;opacity:.3">💊</div><div style="font-size:12px">Sin recetas registradas</div>
+          <?php if($mascota_id): ?><a href="?p=historial&action=nueva&mascota_id=<?= $mascota_id ?>" class="btn btn-primary btn-xs" style="margin-top:10px">+ Nueva atención</a><?php endif; ?>
+        </div>
+        <?php else: foreach($recetas_hc as $rx): $fr=strtotime($rx['fecha']); ?>
+        <div class="hc-item" style="cursor:pointer" onclick="window.open('?p=recetas&action=imprimir&id=<?= (int)$rx['id'] ?>','_blank')">
+          <div class="hc-dot" style="background:#10b981"></div>
+          <div class="hc-fecha-col"><div class="hc-dia"><?= date('d',$fr) ?></div><div class="hc-mes"><?= $mes_abr[date('m',$fr)]??date('M',$fr) ?></div><div class="hc-anio"><?= date('Y',$fr) ?></div></div>
+          <div class="hc-item-body">
+            <div class="hc-item-tipo">💊 Receta médica</div>
+            <div class="hc-item-diag"><?= !empty($rx['medicamentos'])?clean(substr($rx['medicamentos'],0,44)):(!empty($rx['indicaciones'])?clean(substr($rx['indicaciones'],0,44)):'—') ?></div>
+            <div class="hc-item-vet"><?= $rx['veterinario']?'Dr/a. '.clean($rx['veterinario']):'' ?></div>
+          </div>
+          <span style="font-size:13px;flex-shrink:0;color:var(--text3)">🖨️</span>
+        </div>
+        <?php endforeach; endif; ?>
+
       <?php elseif(empty($consultas)): ?>
       <div class="hc-empty-small"><div style="font-size:32px;margin-bottom:8px;opacity:.3">📋</div><div style="font-size:12px">Sin registros encontrados</div>
         <?php if($mascota_id): ?><a href="?p=historial&action=nueva&mascota_id=<?= $mascota_id ?>" class="btn btn-primary btn-xs" style="margin-top:10px">+ Nueva atención</a><?php endif; ?>

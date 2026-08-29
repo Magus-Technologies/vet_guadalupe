@@ -223,7 +223,10 @@ $_default_vet = $vets_sel[0] ?? null;
     <div class="form-row">
       <!-- Mascota buscador -->
       <div class="form-group" style="position:relative">
-        <label class="form-label required">Mascota</label>
+        <label class="form-label required" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Mascota</span>
+          <a href="javascript:void(0)" onclick="rrAbrir()" style="font-size:11px;font-weight:600;color:var(--primary);text-decoration:none">➕ Registrar nuevo</a>
+        </label>
         <input type="text" id="inp-mas-cita" class="form-input"
                placeholder="🐾 Buscar mascota..."
                value="<?= clean($_editing_mas['label']??'') ?>"
@@ -296,9 +299,15 @@ $_default_vet = $vets_sel[0] ?? null;
     <div class="flex gap-1"><button type="submit" class="btn btn-primary">💾 Guardar cita</button><a href="?p=citas" class="btn">Cancelar</a></div>
   </form>
 </div>
+
+<?php $RR_HID='hid-mas-cita'; $RR_INP='inp-mas-cita'; include __DIR__ . '/../includes/registro_rapido_modal.php'; ?>
+
 <script>
 var _MAS_CITA = <?= json_encode(array_values($_mascotas_js)) ?>;
 var _VET_CITA = <?= json_encode(array_values($_vets_js)) ?>;
+
+// Al crear una mascota desde el registro rápido, agregarla al buscador y seleccionarla
+window.rrOnCreated = function(d){ _MAS_CITA.unshift({id:d.mascota_id,label:d.label}); };
 document.addEventListener('DOMContentLoaded', function() {
     vetSearchSelect('inp-mas-cita','drop-mas-cita','hid-mas-cita', _MAS_CITA, 'label');
     vetSearchSelect('inp-vet-cita','drop-vet-cita','hid-vet-cita', _VET_CITA, 'label');

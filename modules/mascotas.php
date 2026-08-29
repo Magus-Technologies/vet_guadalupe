@@ -233,6 +233,14 @@ if ($action==='ver' && isset($_GET['id'])) {
     $st=$db->prepare("SELECT m.*,c.nombre as dueno,c.telefono,c.email,c.dni FROM mascotas m JOIN clientes c ON c.id=m.cliente_id WHERE m.id=?");
     $st->execute([$mid]); $m=$st->fetch();
     if (!$m) { $action='list'; goto list_view; }
+    // Token del carné de vacunación (QR público). Se genera una sola vez por mascota.
+    $carne_token = $m['carne_token'] ?? '';
+    try {
+        $col = $db->query("SHOW COLUMNS FROM mascotas LIKE 'carne_token'")->fetchAll();
+        if (empty($col)) { $db->exec("ALTER TABLE mascotas ADD COLUMN carne_token VARCHAR(40) NULL"); try{ $db->exec("CREATE INDEX idx_carne_token ON mascotas (carne_token)"); }catch(Exception $e){} }
+        if (empty($carne_token)) { $carne_token = bin2hex(random_bytes(16)); $db->prepare("UPDATE mascotas SET carne_token=? WHERE id=?")->execute([$carne_token,$mid]); }
+    } catch(Exception $e) { $carne_token=''; }
+    $carne_url = BASE_URL.'/carne.php?t='.$carne_token;
     $foto_url = !empty($m['foto'])&&file_exists(UPLOADS_PATH.'/'.$m['foto']) ? BASE_URL.'/public/uploads/'.$m['foto'] : null;
     // Historial actividad reciente
     $actividad=$db->prepare("
@@ -246,6 +254,9 @@ if ($action==='ver' && isset($_GET['id'])) {
     // Stats
     $n_consultas=$db->prepare("SELECT COUNT(*) FROM consultas WHERE mascota_id=?");$n_consultas->execute([$mid]);$n_consultas=(int)$n_consultas->fetchColumn();
     $n_vacunas=$db->prepare("SELECT COUNT(*) FROM vacunas WHERE mascota_id=?");$n_vacunas->execute([$mid]);$n_vacunas=(int)$n_vacunas->fetchColumn();
+    // Historial de peso (para la curva de crecimiento) — de cada consulta con peso registrado
+    $peso_hist=[];
+    try { $ph=$db->prepare("SELECT fecha, peso_actual FROM consultas WHERE mascota_id=? AND peso_actual IS NOT NULL AND peso_actual>0 ORDER BY fecha ASC, id ASC"); $ph->execute([$mid]); $peso_hist=$ph->fetchAll(); } catch(Exception $e){ $peso_hist=[]; }
     try{$n_examenes=$db->prepare("SELECT COUNT(*) FROM examenes_auxiliares WHERE mascota_id=?");$n_examenes->execute([$mid]);$n_examenes=(int)$n_examenes->fetchColumn();}catch(Exception $e){$n_examenes=0;}
     // Próximas acciones
     $prox_cita=$db->prepare("SELECT * FROM citas WHERE mascota_id=? AND fecha>=CURDATE() AND estado IN ('pendiente','confirmada') ORDER BY fecha ASC LIMIT 1");$prox_cita->execute([$mid]);$prox_cita=$prox_cita->fetch();
@@ -378,6 +389,7 @@ try{$n_hosp=$db->prepare("SELECT COUNT(*) FROM hospitalizaciones WHERE mascota_i
         <a href="<?= BASE_URL ?>/index.php?p=citas&action=nueva" class="mas-dmenu-item">📅 Agendar cita</a>
         <a href="<?= BASE_URL ?>/index.php?p=vacunas&action=nueva&mascota_id=<?= $m['id'] ?>" class="mas-dmenu-item">💉 Registrar vacuna</a>
         <a href="<?= BASE_URL ?>/index.php?p=examenes&action=nuevo&mascota_id=<?= $m['id'] ?>" class="mas-dmenu-item">🔬 Nuevo examen</a>
+        <?php if(!empty($carne_token)): ?><a href="<?= $carne_url ?>" target="_blank" class="mas-dmenu-item">🪪 Carné de vacunación (QR)</a><?php endif; ?>
         <a href="https://wa.me/<?= $tel ?>" target="_blank" class="mas-dmenu-item">💬 WhatsApp dueño</a>
       </div>
     </div>
@@ -484,6 +496,52 @@ try{$n_hosp=$db->prepare("SELECT COUNT(*) FROM hospitalizaciones WHERE mascota_i
             <div class="mas-field"><span class="mas-field-label">Alimentación</span><span class="mas-field-val" style="max-width:120px;text-align:right"><?= clean($m['alimentacion']??'—') ?></span></div>
           </div>
         </div>
+        <!-- Curva de peso / crecimiento -->
+        <div class="mas-sec-title" style="margin-top:4px">📈 Curva de peso</div>
+        <?php if(count($peso_hist) < 1): ?>
+          <div style="text-align:center;padding:16px;color:var(--text3);font-size:12px;background:var(--bg2);border:1px dashed var(--border);border-radius:12px;margin-bottom:14px">
+            Aún no hay pesos registrados en consultas. La curva se dibuja sola a medida que registres atenciones con peso.
+          </div>
+        <?php else:
+          $pw = array_map(fn($r)=>(float)$r['peso_actual'], $peso_hist);
+          $n = count($pw);
+          $minW = min($pw); $maxW = max($pw);
+          $first = $pw[0]; $last = $pw[$n-1]; $delta = $last - $first;
+          $range = ($maxW - $minW); if($range <= 0){ $range = max(0.1, $maxW*0.1); }
+          $ymin = $minW - $range*0.15; if($ymin < 0) $ymin = 0; $ymax = $maxW + $range*0.15;
+          if($ymax <= $ymin) $ymax = $ymin + 0.1;
+          $W=600;$H=190;$padL=42;$padR=14;$padT=14;$padB=30;
+          $plotW=$W-$padL-$padR; $plotH=$H-$padT-$padB;
+          $fmt = fn($v)=>rtrim(rtrim(number_format($v,3,'.',''),'0'),'.');
+          $X = fn($i)=>$padL + ($n>1 ? $i*($plotW/($n-1)) : $plotW/2);
+          $Y = fn($v)=>$padT + (1-(($v-$ymin)/($ymax-$ymin)))*$plotH;
+          $pts=[]; foreach($pw as $i=>$v){ $pts[]=round($X($i),1).','.round($Y($v),1); }
+          $poly=implode(' ',$pts);
+          $dc = $delta>0?['#065f46','#d1fae5','▲']:($delta<0?['#7f1d1d','#fee2e2','▼']:['#475569','#f1f5f9','=']);
+        ?>
+        <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:12px 10px 6px;margin-bottom:14px">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;padding:0 6px 6px;flex-wrap:wrap;gap:6px">
+            <div><span style="font-size:22px;font-weight:800;color:var(--text)"><?= $fmt($last) ?></span> <span style="font-size:12px;color:var(--text3)">kg (último)</span></div>
+            <div><span class="badge" style="background:<?= $dc[1] ?>;color:<?= $dc[0] ?>"><?= $dc[2] ?> <?= ($delta>0?'+':'').$fmt($delta) ?> kg</span>
+              <span style="font-size:11px;color:var(--text3);margin-left:4px"><?= $n ?> registro<?= $n>1?'s':'' ?></span></div>
+          </div>
+          <svg viewBox="0 0 <?= $W ?> <?= $H ?>" style="width:100%;height:auto;display:block" preserveAspectRatio="xMidYMid meet">
+            <?php foreach([$ymax,($ymax+$ymin)/2,$ymin] as $gl){ $gy=round($Y($gl),1); ?>
+            <line x1="<?= $padL ?>" y1="<?= $gy ?>" x2="<?= $W-$padR ?>" y2="<?= $gy ?>" stroke="var(--border)" stroke-width="1" stroke-dasharray="3 3"/>
+            <text x="<?= $padL-6 ?>" y="<?= $gy+3 ?>" text-anchor="end" font-size="10" fill="var(--text3)"><?= $fmt($gl) ?></text>
+            <?php } ?>
+            <?php if($n>1): ?><polyline points="<?= $poly ?>" fill="none" stroke="#0ea5a4" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/><?php endif; ?>
+            <?php foreach($pw as $i=>$v){ $cx=round($X($i),1);$cy=round($Y($v),1); $isLast=($i===$n-1); ?>
+            <circle cx="<?= $cx ?>" cy="<?= $cy ?>" r="<?= $isLast?4.5:3.5 ?>" fill="<?= $isLast?'#0369a1':'#0ea5a4' ?>" stroke="#fff" stroke-width="1.5"/>
+            <?php } ?>
+            <?php $labels=[0=>$peso_hist[0]['fecha'], $n-1=>$peso_hist[$n-1]['fecha']]; if($n>=5){ $mid=intdiv($n-1,2); $labels[$mid]=$peso_hist[$mid]['fecha']; }
+              foreach($labels as $i=>$f){ $tx=round($X($i),1); $anchor=$i==0?'start':($i==$n-1?'end':'middle'); ?>
+            <text x="<?= $tx ?>" y="<?= $H-8 ?>" text-anchor="<?= $anchor ?>" font-size="10" fill="var(--text3)"><?= date('d/m/y',strtotime($f)) ?></text>
+            <?php } ?>
+          </svg>
+        </div>
+        <?php endif; ?>
+
         <!-- Alertas médicas -->
         <?php if($m['alergias']): ?>
         <div class="alert alert-warn mb-2"><span class="alert-icon">⚠️</span><div><strong>Alergias:</strong> <?= clean($m['alergias']) ?></div></div>
@@ -623,6 +681,7 @@ try{$n_hosp=$db->prepare("SELECT COUNT(*) FROM hospitalizaciones WHERE mascota_i
         <a href="<?= BASE_URL ?>/index.php?p=citas&action=nueva" class="mas-dmenu-item">📅 Agendar cita</a>
         <a href="<?= BASE_URL ?>/index.php?p=vacunas&action=nueva&mascota_id=<?= $m['id'] ?>" class="mas-dmenu-item">💉 Registrar vacuna</a>
         <a href="<?= BASE_URL ?>/index.php?p=examenes&action=nuevo&mascota_id=<?= $m['id'] ?>" class="mas-dmenu-item">🔬 Nuevo examen</a>
+        <?php if(!empty($carne_token)): ?><a href="<?= $carne_url ?>" target="_blank" class="mas-dmenu-item">🪪 Carné de vacunación (QR)</a><?php endif; ?>
         <a href="https://wa.me/<?= $tel ?>" target="_blank" class="mas-dmenu-item">💬 WhatsApp dueño</a>
       </div>
     </div>
