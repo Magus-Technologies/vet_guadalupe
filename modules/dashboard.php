@@ -3,6 +3,12 @@ $page = 'dashboard'; $pageTitle = 'Dashboard';
 require_once __DIR__ . '/../includes/header.php';
 $db = getDB();
 
+/* Roles sin acceso a caja (p. ej. veterinario) no ven cifras acumuladas de
+   dinero: ni el KPI de ingresos, ni el resumen por método de pago, ni la
+   gráfica de recaudación mensual. Siguen viendo agenda, pacientes y stock. */
+$ver_dinero = canViewMoney();
+$kpi_cols   = $ver_dinero ? 5 : 4;
+
 // Verificar qué tablas tienen sede_id (seguro, sin crashear)
 $_has_sede = [];
 foreach (['ventas','citas','clientes','mascotas','consultas','productos','petshop_productos','compras'] as $t) {
@@ -124,7 +130,7 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
 .db-wrap { display:flex; flex-direction:column; gap:18px; }
 
 /* KPI cards */
-.kpi-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:14px; }
+.kpi-grid { display:grid; grid-template-columns:repeat(var(--kpi-cols,5),1fr); gap:14px; }
 .kpi-card {
   background:var(--bg2); border:1px solid var(--border);
   border-radius:14px; padding:18px 20px;
@@ -234,7 +240,7 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
 .kpi-link{text-decoration:none;color:inherit;cursor:pointer;transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease}
 .kpi-link:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg,0 10px 30px rgba(0,0,0,.10));border-color:var(--primary)}
 </style>
-<div class="kpi-grid">
+<div class="kpi-grid" style="--kpi-cols:<?= $kpi_cols ?>">
   <!-- Citas hoy -->
   <a href="?p=citas" class="kpi-card kpi-link" title="Ir a Citas / Agenda">
     <div class="kpi-icon blue">📅</div>
@@ -262,6 +268,7 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
     </div>
   </a>
   <!-- Ingresos -->
+  <?php if($ver_dinero): ?>
   <a href="?p=caja" class="kpi-card kpi-link" title="Ir a Caja">
     <div class="kpi-icon orange">💰</div>
     <div class="flex-1">
@@ -273,6 +280,7 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
       <div class="kpi-sub kpi-neutral">Meta mes: S/ <?= number_format($ingresos_mes,0) ?></div>
     </div>
   </a>
+  <?php endif; ?>
   <!-- Nuevos clientes -->
   <a href="?p=clientes" class="kpi-card kpi-link" title="Ir a Clientes">
     <div class="kpi-icon purple">👥</div>
@@ -368,6 +376,7 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
     </div>
 
     <!-- RESUMEN INGRESOS + MINI CHART -->
+    <?php if($ver_dinero): ?>
     <div class="ing-wrap">
       <div class="ing-head">
         <div>
@@ -400,6 +409,7 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
         <div class="ing-stat" style="border-top:1px solid var(--border);border-right:none"><div class="ing-stat-val">🏦 S/ <?= number_format($transf,2) ?></div><div class="ing-stat-label">Transferencia</div></div>
       </div>
     </div>
+    <?php endif; ?>
 
     <!-- PACIENTES RECIENTES -->
     <div class="agenda-wrap">
@@ -547,7 +557,7 @@ $tipo_icons = ['consulta'=>'🩺','vacuna'=>'💉','control'=>'🔄','cirugia'=>
 <!-- ══ GRÁFICAS REALES ══ -->
 <?php
 $ingresos_12 = [];
-for($i=5;$i>=0;$i--){
+if ($ver_dinero) for($i=5;$i>=0;$i--){
     $mes = date('Y-m', strtotime("-$i months"));
     $tot = 0;
     try { $tot=(float)$db->query("SELECT COALESCE(SUM(total),0) FROM ventas v WHERE DATE_FORMAT(v.fecha,'%Y-%m')='$mes' AND v.estado='pagado'$sv")->fetchColumn(); }catch(Exception $e){}
@@ -570,8 +580,9 @@ try {
     📊 <span>Análisis del negocio</span>
   </div>
 
-  <div style="display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:16px">
+  <div style="display:grid;grid-template-columns:<?= $ver_dinero ? '2fr 1fr' : '1fr' ?>;gap:16px;margin-bottom:16px">
     <!-- Gráfica ingresos 12 meses -->
+    <?php if($ver_dinero): ?>
     <div class="card" style="padding:18px">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
         <div>
@@ -585,6 +596,7 @@ try {
       </div>
       <div style="height:120px;position:relative"><canvas id="chartIngresos"></canvas></div>
     </div>
+    <?php endif; ?>
     <!-- Gráfica especies -->
     <div class="card" style="padding:18px">
       <div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:2px">🐾 Especies</div>
@@ -621,6 +633,7 @@ var primary = '#1ea8a1';
 var accent  = '#6366f1';
 
 // ── 1. Ingresos 12 meses (bar + line) ──
+<?php if($ver_dinero): ?>
 var ing12Labels = <?= json_encode(array_map(fn($m)=>date('M y',strtotime($m.'-01')), array_keys($ingresos_12))) ?>;
 var ing12Data   = <?= json_encode(array_values($ingresos_12)) ?>;
 new Chart(document.getElementById('chartIngresos'), {
@@ -649,6 +662,7 @@ new Chart(document.getElementById('chartIngresos'), {
     }
   }
 });
+<?php endif; ?>
 
 // ── 2. Especies (doughnut) ──
 var espLabels = <?= json_encode(array_map(fn($e)=>ucfirst($e['especie']), $especies)) ?>;

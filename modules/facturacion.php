@@ -5,6 +5,23 @@ $user = getUser();
 $action = $_GET['action'] ?? 'list';
 $msg = '';
 
+/* Alcance del módulo según el rol:
+   - $ver_dinero  → puede leer acumulados (recaudación del período).
+   - $solo_mios   → solo ve/opera los comprobantes que emitió él mismo.
+   Un veterinario factura sin problema, pero no ve la caja de la clínica ni
+   los comprobantes de sus colegas. Ver canViewMoney() en includes/config.php. */
+$ver_dinero = canViewMoney();
+$solo_mios  = !canViewAllSales();
+$mi_id      = (int)($user['id'] ?? 0);
+
+/** Corta la ejecución si el comprobante no pertenece al usuario restringido. */
+function ventaPropia(PDO $db, int $venta_id, int $usuario_id): bool {
+    $st = $db->prepare("SELECT usuario_id FROM ventas WHERE id=?");
+    $st->execute([$venta_id]);
+    $dueno = $st->fetchColumn();
+    return $dueno !== false && (int)$dueno === $usuario_id;
+}
+
 // ── Función global: serie según sede ─────────────────────────
 function getSerieParaSede($db, $tipo_comp, $sede_id) {
     $clave = $tipo_comp === 'factura' ? 'serie_factura' :
@@ -257,6 +274,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($pa === 'anular') {
         $anular_id = (int)$_POST['id'];
 
+        // Anular mueve stock y caja: exige permiso de eliminar, y el rol
+        // restringido solo puede anular lo que él mismo emitió.
+        if (!canDelete('facturacion') || ($solo_mios && !ventaPropia($db, $anular_id, $mi_id))) {
+            $_SESSION['flash_error'] = 'No tienes permiso para anular este comprobante.';
+            header('Location: '.BASE_URL.'/index.php?p=facturacion');
+            exit;
+        }
+
         // Un comprobante ya emitido a SUNAT no se da de baja con un UPDATE:
         // requiere nota de crédito. Se redirige en vez de anular a ciegas.
         $st = $db->prepare("SELECT sunat_xml FROM ventas WHERE id=?");
@@ -298,13 +323,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $msg='anulado'; $action='list';
     }
     if ($pa === 'cobrar') {
-        $db->prepare("UPDATE ventas SET estado='pagado',metodo_pago=? WHERE id=?")->execute([$_POST['metodo_pago'],(int)$_POST['id']]);
+        $cobrar_id = (int)$_POST['id'];
+        if ($solo_mios && !ventaPropia($db, $cobrar_id, $mi_id)) {
+            $_SESSION['flash_error'] = 'No tienes permiso para cobrar este comprobante.';
+            header('Location: '.BASE_URL.'/index.php?p=facturacion');
+            exit;
+        }
+        $db->prepare("UPDATE ventas SET estado='pagado',metodo_pago=? WHERE id=?")->execute([$_POST['metodo_pago'],$cobrar_id]);
         $msg='cobrado'; $action='list';
     }
 
     // ── ENVIAR A SUNAT (manual, post-emisión) ──
     if ($pa === 'enviar_sunat') {
         $vid = (int)($_POST['id'] ?? 0);
+        if ($solo_mios && !ventaPropia($db, $vid, $mi_id)) {
+            $_SESSION['flash_error'] = 'No tienes permiso sobre este comprobante.';
+            header('Location: '.BASE_URL.'/index.php?p=facturacion');
+            exit;
+        }
         $sunat_cfg = __DIR__ . '/../includes/config_sunat.php';
         $sunat_svc = __DIR__ . '/../includes/sunat/SunatService.php';
         if (file_exists($sunat_cfg) && file_exists($sunat_svc)) {
@@ -369,6 +405,9 @@ if (in_array($action, ['xml', 'cdr'], true) && !empty($_GET['id'])) {
     $st->execute([$vid]);
     $v = $st->fetch();
     if (!$v) { http_response_code(404); echo 'Venta no encontrada.'; exit; }
+    if ($solo_mios && !ventaPropia($db, $vid, $mi_id)) {
+        http_response_code(403); echo 'No tienes acceso a este comprobante.'; exit;
+    }
 
     $tipo = $v['tipo_comprobante'] === 'factura' ? '01' : '03';
     $base = SUNAT_RUC.'-'.$tipo.'-'.$v['serie'].'-'.str_pad($v['numero'], 8, '0', STR_PAD_LEFT);
@@ -408,6 +447,12 @@ if ($action === 'ver' && !empty($_GET['id'])) {
         LEFT JOIN usuarios u ON u.id=v.usuario_id
         WHERE v.id=?");
     $st->execute([$vid]); $venta_detalle = $st->fetch();
+
+    // Rol restringido: solo abre los comprobantes que emitió él mismo.
+    if ($venta_detalle && $solo_mios && (int)$venta_detalle['usuario_id'] !== $mi_id) {
+        $venta_detalle = null;
+        $_SESSION['flash_error'] = 'Ese comprobante fue emitido por otro usuario.';
+    }
 
     $st2 = $db->prepare("SELECT * FROM venta_items WHERE venta_id=? ORDER BY id ASC");
     $st2->execute([$vid]); $items_detalle = $st2->fetchAll();
@@ -483,6 +528,11 @@ if ($search) {
 }
 // Filtro por sede (sin afectar lógica SUNAT)
 if (!verTodasSedes()) { $where .= " AND v.sede_id=" . getSede(); }
+
+/* Rol restringido (p. ej. veterinario): solo sus propios comprobantes. Va en
+   $where —no en la consulta del listado— para que los contadores, los totales
+   y la paginación se calculen sobre el mismo universo que la grilla. */
+if ($solo_mios) { $where .= " AND v.usuario_id=" . $mi_id; }
 
 /* Los totales se calculan sobre TODO el filtro, no sobre la página visible:
    sumarlos desde $ventas daba cifras cortadas cuando el período tenía más
@@ -1022,7 +1072,7 @@ if (isset($_SESSION['flash_error'])) {
   <?php endif; ?>
 
   <!-- ANULAR -->
-  <?php if($venta_detalle['estado']==='pagado'): ?>
+  <?php if($venta_detalle['estado']==='pagado' && canDelete('facturacion')): ?>
   <?php if(!empty($venta_detalle['sunat_xml'])): ?>
     <!-- Comprobante electrónico: ante SUNAT solo se da de baja con nota de crédito. -->
     <a href="?p=notas_credito&action=nueva&venta_id=<?= $venta_detalle['id'] ?>"
@@ -1064,9 +1114,11 @@ if (isset($_SESSION['flash_error'])) {
 
 <?php else: ?>
 <!-- ════════════════════════════ LISTA ════════════════════════════ -->
-<div class="grid g4 mb-2">
+<div class="grid <?= $ver_dinero ? 'g4' : 'g3' ?> mb-2">
+  <?php if($ver_dinero): ?>
   <div class="stat-card"><div class="stat-icon si-teal">💰</div><div class="stat-value">S/. <?= number_format($total_periodo,0) ?></div><div class="stat-label">Ingresos del período</div></div>
-  <div class="stat-card"><div class="stat-icon si-blue">🧾</div><div class="stat-value"><?= $total_filtrado ?></div><div class="stat-label">Comprobantes</div></div>
+  <?php endif; ?>
+  <div class="stat-card"><div class="stat-icon si-blue">🧾</div><div class="stat-value"><?= $total_filtrado ?></div><div class="stat-label"><?= $solo_mios ? 'Mis comprobantes' : 'Comprobantes' ?></div></div>
   <div class="stat-card"><div class="stat-icon si-teal">✅</div><div class="stat-value"><?= (int)$res['n_pagados'] ?></div><div class="stat-label">Pagados</div></div>
   <div class="stat-card"><div class="stat-icon si-amber">⏳</div><div class="stat-value"><?= (int)$res['n_pendientes'] ?></div><div class="stat-label">Pendientes</div></div>
 </div>

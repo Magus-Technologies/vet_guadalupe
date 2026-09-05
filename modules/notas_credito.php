@@ -6,8 +6,12 @@ $user      = getUser();
 $action    = $_GET['action'] ?? 'lista';
 $id        = (int)($_GET['id'] ?? 0);
 
-// Las notas afectan comprobantes: comparten el permiso de facturación.
-if (!canView('facturacion')) {
+/* Las notas afectan comprobantes ya emitidos: una nota de crédito es la forma
+   legal de anular ante SUNAT. Por eso no basta con "ver" facturación —se exige
+   el permiso de ELIMINAR de ese módulo, el mismo que gobierna el botón Anular—.
+   De lo contrario un rol que solo emite comprobantes (veterinario) podría
+   revertirlos entrando por acá. */
+if (!canView('facturacion') || !canDelete('facturacion')) {
     $_SESSION['flash_error'] = 'No tienes permiso para acceder a este módulo.';
     header('Location: ' . BASE_URL . '/index.php?p=dashboard'); exit;
 }

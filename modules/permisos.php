@@ -28,12 +28,18 @@ $modulos = [
     'petshop'     => ['🛒','Pet Shop'],
     'farmacia'    => ['💊','Farmacia'],
     'inventario'  => ['📦','Inventario'],
+    'compras'     => ['🛒','Compras'],
     'facturacion' => ['🧾','Facturación'],
     'caja'        => ['💰','Caja'],
+    'reporte_pagos'=>['💳','Reporte de Pagos'],
+    'cuentas'     => ['📋','Cuentas por cobrar'],
+    'movimientos' => ['📦','Movimientos'],
     'reportes'    => ['📊','Reportes'],
     'personal'    => ['👤','Personal'],
     'plantillas'  => ['🖨️','Plantillas'],
     'whatsapp'    => ['💬','WhatsApp'],
+    'solicitudes' => ['📩','Solicitudes'],
+    'servicios'   => ['🏷️','Servicios'],
     'ganado'      => ['🐄','Ganado Vacuno'],
 ];
 
@@ -154,6 +160,10 @@ try {
       <div>
         <div style="font-size:14px;font-weight:700"><?= $rol_info[$tab_rol][0] ?> Permisos de <?= $rol_info[$tab_rol][1] ?></div>
         <div style="font-size:12px;color:var(--text3)"><?= $rol_info[$tab_rol][2] ?></div>
+        <div style="font-size:11px;color:var(--text3);margin-top:4px">
+          💡 <strong>Caja</strong> controla los montos acumulados: sin “Ver” en Caja, el rol no ve
+          ingresos ni egresos en el Dashboard y en Facturación solo ve los comprobantes que emitió.
+        </div>
       </div>
       <div style="display:flex;gap:8px;align-items:center">
         <button type="button" onclick="marcarTodo(true)" class="btn btn-sm btn-ghost">✅ Todo ON</button>
@@ -179,11 +189,11 @@ try {
         <tbody>
           <?php
           $section_map = [
-            'PRINCIPAL'  => ['dashboard','citas','clientes'],
+            'PRINCIPAL'  => ['dashboard','citas','solicitudes','clientes'],
             'CLÍNICA'    => ['mascotas','historial','recetas','examenes','vacunas','cirugias','hospital'],
-            'SERVICIOS'  => ['grooming','petshop'],
-            'INVENTARIO' => ['farmacia','inventario'],
-            'GESTIÓN'    => ['facturacion','caja','reportes','personal','plantillas','whatsapp'],
+            'SERVICIOS'  => ['grooming','petshop','servicios'],
+            'INVENTARIO' => ['farmacia','inventario','compras','movimientos'],
+            'GESTIÓN'    => ['facturacion','caja','reporte_pagos','cuentas','reportes','personal','plantillas','whatsapp'],
             'GANADERÍA'  => ['ganado'],
           ];
           $current_section = '';
@@ -265,18 +275,22 @@ function marcarTodo(val) {
     cb.checked = val;
   });
 }
-// Lógica: si desactiva "ver", desactiva todo lo demás automáticamente
+/* "Ver" es la puerta de entrada al módulo: el menú y el router lo consultan
+   antes que nada. Sin él, crear/editar/eliminar/exportar quedan huérfanos —el
+   rol nunca llega a la pantalla donde usarlos—. Por eso apagar "Ver" apaga
+   todo, y prender cualquier otra acción prende "Ver". */
 document.querySelectorAll('input[data-modulo]').forEach(function(cb) {
-  if(cb.name.endsWith('_ver')) {
-    cb.addEventListener('change', function() {
-      if(!this.checked) {
-        var mod = this.dataset.modulo;
-        document.querySelectorAll('input[data-modulo="'+mod+'"]').forEach(function(c) {
-          c.checked = false;
-        });
-      }
-    });
-  }
+  cb.addEventListener('change', function() {
+    var mod  = this.dataset.modulo;
+    var caja = document.querySelectorAll('input[data-modulo="'+mod+'"]');
+    if (this.name.endsWith('_ver')) {
+      if (!this.checked) caja.forEach(function(c) { c.checked = false; });
+      return;
+    }
+    if (this.checked) {
+      caja.forEach(function(c) { if (c.name.endsWith('_ver')) c.checked = true; });
+    }
+  });
 });
 </script>
 <?php require_once __DIR__ . '/../includes/footer.php'; ?>

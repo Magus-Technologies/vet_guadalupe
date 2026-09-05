@@ -131,13 +131,28 @@ static $cache = null;
     } catch(Exception $e) { return []; }
 }
 
+/**
+ * Módulos que no tienen fila propia en `permisos` y se apoyan en la de otro
+ * módulo del mismo dominio. Sin esto `canView('calendario')` daba siempre
+ * false —la tabla guarda ese permiso bajo el nombre `citas`— y la agenda
+ * desaparecía del menú aunque el rol la tuviera habilitada.
+ */
+function permAlias($modulo) {
+    static $alias = [
+        'calendario'    => 'citas',
+        'notas_credito' => 'facturacion',
+        'reenvio_sunat' => 'facturacion',
+    ];
+    return $alias[$modulo] ?? $modulo;
+}
+
 function can($modulo, $accion = 'ver') {
     $user = getUser();
     if (!$user) return false;
     if ($user['rol'] === 'admin') return true;
     $permisos = loadPermisos();
     if (isset($permisos['__admin__'])) return true;
-    return $permisos[$modulo][$accion] ?? false;
+    return $permisos[permAlias($modulo)][$accion] ?? false;
 }
 
 function canView($modulo)   { return can($modulo, 'ver'); }
@@ -145,6 +160,29 @@ function canCreate($modulo) { return can($modulo, 'crear'); }
 function canEdit($modulo)   { return can($modulo, 'editar'); }
 function canDelete($modulo) { return can($modulo, 'eliminar'); }
 function canExport($modulo) { return can($modulo, 'exportar'); }
+
+/**
+ * ¿Puede el usuario ver cifras de dinero agregadas? Es decir: ingresos del
+ * día, recaudación del período, gráficas de facturación y totales de caja.
+ *
+ * La regla se apoya en el módulo `caja`: un rol que no entra a la caja no
+ * tiene por qué leer la recaudación de la clínica. Los roles que solo emiten
+ * comprobantes (p. ej. veterinario) siguen facturando con normalidad; lo
+ * único que no ven son los acumulados. El importe de cada comprobante suelto
+ * sí se muestra, porque sin él no se puede emitir ni entregar.
+ */
+function canViewMoney() {
+    $user = getUser();
+    if (!$user) return false;
+    if ($user['rol'] === 'admin') return true;
+    return can('caja', 'ver');
+}
+
+/**
+ * ¿Ve los comprobantes de todo el personal, o solo los que emitió él mismo?
+ * Misma regla que canViewMoney(): quien no ve la recaudación ve solo lo suyo.
+ */
+function canViewAllSales() { return canViewMoney(); }
 
 function clearPermisosCache() { unset($_SESSION['permisos']); }
 
