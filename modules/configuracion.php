@@ -221,7 +221,13 @@ try {
 
 // Series por defecto si no están configuradas
 function getSerieDefault($tipo, $sede_id) {
-    $prefijos = ['serie_factura'=>'F','serie_boleta'=>'B','serie_ticket'=>'T','serie_nota_credito'=>'NC','serie_nota_debito'=>'ND'];
+    // Nota de crédito/débito: 4 caracteres con prefijo F/B según el comprobante
+    // que modifica. El módulo de notas valida y deriva la serie si no aplica.
+    if ($tipo === 'serie_nota_credito' || $tipo === 'serie_nota_debito') {
+        $pref = $tipo === 'serie_nota_debito' ? 'BD' : 'BC';
+        return $pref . str_pad($sede_id, 2, '0', STR_PAD_LEFT);
+    }
+    $prefijos = ['serie_factura'=>'F','serie_boleta'=>'B','serie_ticket'=>'T'];
     $pref = $prefijos[$tipo] ?? 'X';
     return $pref . str_pad($sede_id, 3, '0', STR_PAD_LEFT);
 }

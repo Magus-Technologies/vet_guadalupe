@@ -22,18 +22,27 @@ if (file_exists($sunat_cfg)) require_once $sunat_cfg;
 if (file_exists($sunat_svc)) require_once $sunat_svc;
 
 /**
- * Serie de nota según la sede del comprobante afectado.
+ * Serie de nota según la sede y el comprobante afectado.
  * Misma jerarquía que getSerieParaSede() en facturacion.php:
- * configuracion_sede → configuracion global (solo sede 1) → prefijo + sede.
+ * configuracion_sede → configuracion global (solo sede 1) → serie derivada.
+ *
+ * Una serie SUNAT tiene 4 caracteres e inicia en F (factura) o B (boleta)
+ * según el comprobante que modifica; si la configurada no cumple, se ignora.
  */
-function getSerieNotaParaSede($db, $tipo_nota, $sede_id) {
-    $clave = $tipo_nota === 'debito' ? 'serie_nota_debito' : 'serie_nota_credito';
+function getSerieNotaParaSede($db, $tipo_nota, $sede_id, $tipo_comprobante = 'boleta') {
+    $clave   = $tipo_nota === 'debito' ? 'serie_nota_debito' : 'serie_nota_credito';
+    $prefijo = $tipo_comprobante === 'factura' ? 'F' : 'B';
+    $sufijo  = $tipo_nota === 'debito' ? 'D' : 'C';
+
+    $valida = function ($v) use ($prefijo) {
+        return is_string($v) && strlen($v) === 4 && strtoupper(substr($v, 0, 1)) === $prefijo;
+    };
 
     try {
         $st = $db->prepare("SELECT valor FROM configuracion_sede WHERE sede_id=? AND clave=?");
         $st->execute([$sede_id, $clave]);
         $v = $st->fetchColumn();
-        if ($v) return $v;
+        if ($valida($v)) return $v;
     } catch (Exception $e) {}
 
     if ($sede_id == 1) {
@@ -41,12 +50,11 @@ function getSerieNotaParaSede($db, $tipo_nota, $sede_id) {
             $st = $db->prepare("SELECT valor FROM configuracion WHERE clave=?");
             $st->execute([$clave]);
             $v = $st->fetchColumn();
-            if ($v) return $v;
+            if ($valida($v)) return $v;
         } catch (Exception $e) {}
     }
 
-    $pref = $tipo_nota === 'debito' ? 'ND' : 'NC';
-    return $pref . str_pad((string)$sede_id, 3, '0', STR_PAD_LEFT);
+    return $prefijo . $sufijo . str_pad((string)$sede_id, 2, '0', STR_PAD_LEFT);
 }
 
 $MOTIVOS = [
@@ -103,7 +111,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             header('Location: ' . BASE_URL . '/index.php?p=notas_credito&action=nueva'); exit;
         }
 
-        $serie  = getSerieNotaParaSede($db, $tipo_nota, (int)($venta['sede_id'] ?? 1));
+        $serie  = getSerieNotaParaSede($db, $tipo_nota, (int)($venta['sede_id'] ?? 1), $venta['tipo_comprobante']);
         $numero = SunatService::siguienteNumeroNota($db, $serie);
 
         $ins = $db->prepare("
@@ -417,14 +425,19 @@ if ($action === 'lista') {
         $venta_sel = 0;
     }
 
-    // Series previsualizables por sede de cada comprobante.
-    $seriesPorSede = [];
+    // Series previsualizables por comprobante (dependen de si es factura o boleta).
+    $seriesPorVenta = [];
+    $seriesCache = [];
     foreach ($ventas as $v) {
         $sid = (int)($v['sede_id'] ?? 1);
-        if (isset($seriesPorSede[$sid])) continue;
-        $seriesPorSede[$sid] = [
-            'credito' => getSerieNotaParaSede($db, 'credito', $sid),
-            'debito'  => getSerieNotaParaSede($db, 'debito',  $sid),
+        $tc  = ($v['tipo_comprobante'] ?? 'boleta') === 'factura' ? 'factura' : 'boleta';
+        foreach (['credito', 'debito'] as $tn) {
+            $k = $sid . '|' . $tc . '|' . $tn;
+            if (!isset($seriesCache[$k])) $seriesCache[$k] = getSerieNotaParaSede($db, $tn, $sid, $tc);
+        }
+        $seriesPorVenta[(int)$v['id']] = [
+            'credito' => $seriesCache[$sid . '|' . $tc . '|credito'],
+            'debito'  => $seriesCache[$sid . '|' . $tc . '|debito'],
         ];
     }
 ?>
@@ -444,7 +457,7 @@ if ($action === 'lista') {
           <select name="venta_id" class="form-input" required id="selVenta">
             <option value="">— Selecciona un comprobante —</option>
             <?php foreach ($ventas as $v): ?>
-              <option value="<?= $v['id'] ?>" data-sede="<?= (int)($v['sede_id'] ?? 1) ?>" <?= $v['id'] == $venta_sel ? 'selected' : '' ?>>
+              <option value="<?= $v['id'] ?>" data-sede="<?= (int)($v['sede_id'] ?? 1) ?>" data-serie-credito="<?= clean($seriesPorVenta[(int)$v['id']]['credito'] ?? '') ?>" data-serie-debito="<?= clean($seriesPorVenta[(int)$v['id']]['debito'] ?? '') ?>" <?= $v['id'] == $venta_sel ? 'selected' : '' ?>>
                 [<?= strtoupper($v['sunat_estado'] ?? '') ?>]
                 <?= $v['estado'] === 'anulado' ? '⚠ ANULADO SIN NOTA · ' : '' ?>
                 <?= strtoupper($v['tipo_comprobante']) ?> ·
@@ -514,12 +527,10 @@ if ($action === 'lista') {
   var pre   = document.getElementById('seriePreview');
   var sel   = document.getElementById('selVenta');
 
-  var seriesPorSede = <?= json_encode($seriesPorSede, JSON_UNESCAPED_UNICODE) ?>;
-
   function update() {
     var tipo = rNC.checked ? 'credito' : 'debito';
     var opt  = sel.options[sel.selectedIndex];
-    var sede = opt ? (opt.dataset.sede || '') : '';
+    var serie = opt ? (tipo === 'credito' ? (opt.dataset.serieCredito || '') : (opt.dataset.serieDebito || '')) : '';
 
     if (tipo === 'credito') {
       lblNC.className = 'btn btn-primary';
@@ -531,8 +542,8 @@ if ($action === 'lista') {
       inf.innerHTML = 'ℹ <strong>Débito:</strong> aumenta el importe del comprobante original (cobros adicionales).';
     }
 
-    pre.textContent = (sede && seriesPorSede[sede] && seriesPorSede[sede][tipo])
-      ? '# Serie: ' + seriesPorSede[sede][tipo]
+    pre.textContent = serie
+      ? '# Serie: ' + serie
       : '# Serie asignada automáticamente al guardar.';
   }
 

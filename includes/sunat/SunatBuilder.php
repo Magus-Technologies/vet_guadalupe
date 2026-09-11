@@ -29,7 +29,7 @@ class SunatBuilder
             'moneda'     => 'PEN',
             'forma_pago' => 'contado',
             'aplica_igv' => $aplica_igv,
-            'detalles'   => self::detalles($items, $aplica_igv),
+            'detalles'   => self::detalles($items, $aplica_igv, (float) ($venta['descuento'] ?? 0)),
         ];
     }
 
@@ -168,17 +168,45 @@ class SunatBuilder
      * Cuando $aplica_igv=true, `precio_unitario` viene CON IGV incluido (Greenter
      * divide entre 1.18 internamente). Cuando $aplica_igv=false, se marca cada
      * item como inafecto (sin IGV).
+     *
+     * Si hay descuento global, se reparte proporcionalmente al bruto de cada item
+     * y se envía el precio neto, de modo que la suma del comprobante coincida con
+     * `ventas.total` (el descuento se aplica antes de desglosar el IGV).
      */
-    private static function detalles(array $items, bool $aplica_igv = true): array
+    private static function detalles(array $items, bool $aplica_igv = true, float $descuentoGlobal = 0.0): array
     {
+        $brutoTotal = 0.0;
+        foreach ($items as $it) {
+            $brutoTotal += (float) $it['cantidad'] * (float) $it['precio_unitario'];
+        }
+        $brutoTotal = round($brutoTotal, 2);
+        $descuento  = min(max(round($descuentoGlobal, 2), 0.0), $brutoTotal);
+        $restante   = $descuento;
+        $ultimo     = count($items) - 1;
+
         $out = [];
         foreach ($items as $i => $it) {
+            $cantidad   = (float) $it['cantidad'];
+            $brutoLinea = round($cantidad * (float) $it['precio_unitario'], 2);
+
+            // Reparto proporcional al bruto; el último item absorbe el remanente
+            // exacto para que la suma de las líneas coincida con el total cobrado.
+            if ($descuento > 0 && $brutoTotal > 0) {
+                $descuentoLinea = $i === $ultimo
+                    ? $restante
+                    : min(floor(($descuento * $brutoLinea / $brutoTotal + 1e-9) * 100) / 100, $brutoLinea);
+            } else {
+                $descuentoLinea = 0.0;
+            }
+            $restante = round($restante - $descuentoLinea, 2);
+            $neto     = round($brutoLinea - $descuentoLinea, 2);
+
             $out[] = [
                 'cod_producto' => (string) ($it['referencia_id'] ?? ($i + 1)),
                 'unidad'       => 'NIU', // NIU=unidad, ZZ=servicio. NIU funciona para ambos en SUNAT beta.
                 'descripcion'  => $it['descripcion'],
-                'cantidad'     => (float) $it['cantidad'],
-                'precio'       => (float) $it['precio_unitario'],
+                'cantidad'     => $cantidad,
+                'precio'       => $cantidad > 0 ? $neto / $cantidad : 0.0,
                 'tipo_igv'     => $aplica_igv ? 'gravado' : 'inafecto',
             ];
         }
