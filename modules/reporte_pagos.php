@@ -102,6 +102,53 @@ if (in_array(($_GET['action'] ?? ''), ['excel','pdf'], true)) {
     $total_general = array_sum(array_column($rows, 'total'));
     $metodo_lbl = ($d['metodo']==='todos') ? 'Todos los métodos' : ($_metodos[$d['metodo']] ?? $d['metodo']);
 
+    // ── Detección automática de la tabla de detalle (ítems) de la venta ──
+    // (Compartido por Excel y PDF.) Igual que el código detecta `venta_pagos`,
+    // buscamos la tabla que guarda los productos/servicios de cada venta.
+    $items_por_venta = [];
+    try {
+        $cand = ['venta_detalle','venta_detalles','detalle_venta','detalle_ventas','venta_items',
+                 'ventas_detalle','ventas_items','venta_productos','items_venta','venta_lineas','detalle'];
+        $meta = null;
+        foreach ($cand as $t) {
+            if (empty($db->query("SHOW TABLES LIKE ".$db->quote($t))->fetchAll())) continue;
+            $cols = array_map(fn($c)=>strtolower($c['Field']), $db->query("SHOW COLUMNS FROM `$t`")->fetchAll());
+            if (!in_array('venta_id', $cols)) continue;
+            $pick = function(array $opts) use ($cols){ foreach($opts as $o){ if(in_array($o,$cols)) return $o; } return null; };
+            $meta = [
+                'tabla' => $t,
+                'cant'  => $pick(['cantidad','cant','qty','unidades','q']),
+                'nom'   => $pick(['descripcion','nombre','producto','producto_nombre','nombre_producto','concepto','detalle','item','glosa','descripcion_item','servicio']),
+                'sub'   => $pick(['subtotal','importe','total','monto','total_item','importe_total']),
+                'pu'    => $pick(['precio_unitario','precio','pu','valor_unitario','precio_venta','p_unit']),
+                'hasid' => in_array('id',$cols),
+            ];
+            break;
+        }
+        if ($meta && $rows) {
+            $vids = array_values(array_unique(array_map(fn($r)=>(int)$r['id'], $rows)));
+            if ($vids) {
+                $in  = implode(',', array_fill(0,count($vids),'?'));
+                $sel = "venta_id";
+                $sel .= $meta['cant'] ? ", `{$meta['cant']}` AS _cant" : ", 1 AS _cant";
+                $sel .= $meta['nom']  ? ", `{$meta['nom']}` AS _nom"   : ", '' AS _nom";
+                if     ($meta['sub'])            $sel .= ", `{$meta['sub']}` AS _sub";
+                elseif ($meta['pu'] && $meta['cant']) $sel .= ", (`{$meta['pu']}`*`{$meta['cant']}`) AS _sub";
+                else   $sel .= ", NULL AS _sub";
+                $ord = $meta['hasid'] ? "id" : "venta_id";
+                $stI = $db->prepare("SELECT $sel FROM `{$meta['tabla']}` WHERE venta_id IN ($in) ORDER BY $ord ASC");
+                $stI->execute($vids);
+                foreach ($stI->fetchAll() as $it) {
+                    $items_por_venta[(int)$it['venta_id']][] = [
+                        'cant' => $it['_cant'],
+                        'nom'  => trim((string)$it['_nom']),
+                        'sub'  => $it['_sub'],
+                    ];
+                }
+            }
+        }
+    } catch (Exception $e) { $items_por_venta = []; }
+
     // ----- EXCEL (XML SpreadsheetML: abre en columnas en cualquier Excel) -----
     if ($_GET['action'] === 'excel') {
         $fname = 'reporte_pagos_'.$d['desde'].'_a_'.$d['hasta'].'.xls';
@@ -110,31 +157,69 @@ if (in_array(($_GET['action'] ?? ''), ['excel','pdf'], true)) {
         header('Cache-Control: max-age=0');
         $esc = fn($v) => htmlspecialchars((string)$v, ENT_QUOTES|ENT_XML1, 'UTF-8');
 
+        // Helpers de celda
+        $cS = fn($v,$st='') => '<Cell'.($st?' ss:StyleID="'.$st.'"':'').'><Data ss:Type="String">'.$esc($v).'</Data></Cell>';
+        $cN = fn($v,$st='') => '<Cell'.($st?' ss:StyleID="'.$st.'"':'').'><Data ss:Type="Number">'.$esc(number_format((float)$v,2,'.','')).'</Data></Cell>';
+        $cQ = fn($v)         => '<Cell><Data ss:Type="Number">'.$esc(0+$v).'</Data></Cell>';
+        $cE = '<Cell></Cell>';
+
         echo '<?xml version="1.0" encoding="UTF-8"?>'."\n";
         echo '<?mso-application progid="Excel.Sheet"?>'."\n";
         echo '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">'."\n";
+        echo '<Styles>'
+            .'<Style ss:ID="t"><Font ss:Bold="1" ss:Size="13"/></Style>'
+            .'<Style ss:ID="b"><Font ss:Bold="1"/></Style>'
+            .'<Style ss:ID="h"><Font ss:Bold="1" ss:Color="#FFFFFF"/><Interior ss:Color="#0D9488" ss:Pattern="Solid"/></Style>'
+            .'</Styles>'."\n";
         echo '<Worksheet ss:Name="Pagos"><Table>'."\n";
         // Encabezado informativo
-        echo '<Row><Cell><Data ss:Type="String">Reporte de Pagos</Data></Cell></Row>'."\n";
+        echo '<Row><Cell ss:StyleID="t"><Data ss:Type="String">Reporte de Pagos</Data></Cell></Row>'."\n";
         echo '<Row><Cell><Data ss:Type="String">Periodo: '.$esc($d['desde']).' a '.$esc($d['hasta']).'  |  Método: '.$esc($metodo_lbl).'</Data></Cell></Row>'."\n";
         echo '<Row></Row>'."\n";
         // Cabecera de columnas
-        $cols = ['N° Recibo','Comprobante','Fecha','Cliente','Método de Pago','Monto'];
-        echo '<Row>'; foreach ($cols as $c) echo '<Cell><Data ss:Type="String">'.$esc($c).'</Data></Cell>'; echo '</Row>'."\n";
-        // Filas
-        foreach ($rows as $r) {
-            echo '<Row>';
-            echo '<Cell><Data ss:Type="String">'.$esc($_num_recibo($r)).'</Data></Cell>';
-            echo '<Cell><Data ss:Type="String">'.$esc(ucfirst($r['tipo_comprobante'])).'</Data></Cell>';
-            echo '<Cell><Data ss:Type="String">'.$esc(date('d/m/Y H:i', strtotime($r['fecha']))).'</Data></Cell>';
-            echo '<Cell><Data ss:Type="String">'.$esc($r['cliente']).'</Data></Cell>';
-            echo '<Cell><Data ss:Type="String">'.$esc($_metodos[$r['metodo_pago']] ?? $r['metodo_pago']).'</Data></Cell>';
-            echo '<Cell><Data ss:Type="Number">'.$esc(number_format((float)$r['total'],2,'.','')).'</Data></Cell>';
-            echo '</Row>'."\n";
+        $cols = ['N° Recibo','Comprobante','Fecha','Cliente','Método de Pago','Monto','Cantidad','Producto / servicio'];
+        echo '<Row>'; foreach ($cols as $c) echo '<Cell ss:StyleID="h"><Data ss:Type="String">'.$esc($c).'</Data></Cell>'; echo '</Row>'."\n";
+
+        // ── Filas: recibo en negrita + sus ítems debajo ──
+        // Agrupamos por venta (una venta puede tener varias filas si el pago fue mixto).
+        $orden = []; $byVenta = [];
+        foreach ($rows as $r) { $vid=(int)$r['id']; if(!isset($byVenta[$vid])){ $byVenta[$vid]=[]; $orden[]=$vid; } $byVenta[$vid][]=$r; }
+
+        foreach ($orden as $vid) {
+            $grp   = $byVenta[$vid];
+            $items = $items_por_venta[$vid] ?? [];
+            $rep   = $grp[0];
+            $nrec  = $_num_recibo($rep);
+            $comp  = ucfirst($rep['tipo_comprobante']);
+            $fch   = date('d/m/Y H:i', strtotime($rep['fecha']));
+            $cli   = $rep['cliente'];
+            $metL  = $_metodos[$rep['metodo_pago']] ?? $rep['metodo_pago'];
+
+            // Caso simple: 1 método y 1 ítem → todo en una sola fila (negrita)
+            if (count($grp)===1 && count($items)===1) {
+                $it = $items[0];
+                echo '<Row>'.$cS($nrec,'b').$cS($comp,'b').$cS($fch,'b').$cS($cli,'b')
+                    .$cS($metL,'b').$cN($rep['total'],'b').$cQ($it['cant']).$cS($it['nom']).'</Row>'."\n";
+                continue;
+            }
+            // Fila(s) cabecera del recibo (una por método de pago si fue mixto)
+            foreach ($grp as $r) {
+                echo '<Row>'
+                    .$cS($_num_recibo($r),'b').$cS(ucfirst($r['tipo_comprobante']),'b')
+                    .$cS(date('d/m/Y H:i',strtotime($r['fecha'])),'b').$cS($r['cliente'],'b')
+                    .$cS($_metodos[$r['metodo_pago']] ?? $r['metodo_pago'],'b').$cN($r['total'],'b')
+                    .$cE.$cE.'</Row>'."\n";
+            }
+            // Filas de ítems (repiten los datos del recibo, Monto en blanco)
+            foreach ($items as $it) {
+                echo '<Row>'.$cS($nrec).$cS($comp).$cS($fch).$cS($cli).$cS($metL).$cE
+                    .$cQ($it['cant']).$cS($it['nom']).'</Row>'."\n";
+            }
         }
+
         // Total
         echo '<Row></Row>'."\n";
-        echo '<Row><Cell></Cell><Cell></Cell><Cell></Cell><Cell></Cell><Cell><Data ss:Type="String">TOTAL</Data></Cell><Cell><Data ss:Type="Number">'.$esc(number_format($total_general,2,'.','')).'</Data></Cell></Row>'."\n";
+        echo '<Row>'.$cE.$cE.$cE.$cE.$cS('TOTAL','b').$cN($total_general,'b').$cE.$cE.'</Row>'."\n";
         echo '</Table></Worksheet></Workbook>';
         exit;
     }
@@ -165,6 +250,10 @@ if (in_array(($_GET['action'] ?? ''), ['excel','pdf'], true)) {
           .r{text-align:right}
           .mix{display:inline-block;background:#fef3c7;color:#92400e;font-size:9px;font-weight:700;padding:1px 6px;border-radius:6px;margin-left:5px;vertical-align:middle}
           .total-row td{border-top:2px solid #0d9488;font-weight:800;font-size:14px;color:#0d9488;background:#f0fdfa!important}
+          tr.rec td{font-weight:700;background:#f0fdfa!important;border-top:1px solid #cbd5e1}
+          tr.itm td{color:#475569;font-size:11px;background:#fff!important;border-top:none}
+          td.qty{text-align:center}
+          td.prod{padding-left:16px}
           .foot{margin-top:18px;text-align:center;color:#94a3b8;font-size:10px;border-top:1px solid #e2e8f0;padding-top:8px}
           @media print{.toolbar{display:none}body{padding:0}@page{margin:16mm;size:A4}}
         </style></head><body>
@@ -180,22 +269,43 @@ if (in_array(($_GET['action'] ?? ''), ['excel','pdf'], true)) {
           &nbsp;·&nbsp; <strong>Recibos:</strong> <?= count($rows) ?>
         </div>
         <table>
-          <thead><tr><th>N° Recibo</th><th>Comprobante</th><th>Fecha</th><th>Cliente</th><th>Método</th><th class="r">Monto</th></tr></thead>
+          <thead><tr><th>N° Recibo</th><th>Comprobante</th><th>Fecha</th><th>Cliente</th><th>Método</th><th class="r">Monto</th><th style="text-align:center">Cantidad</th><th>Producto / servicio</th></tr></thead>
           <tbody>
-          <?php foreach ($rows as $r): ?>
-            <tr>
-              <td><?= htmlspecialchars($_num_recibo($r)) ?></td>
-              <td><?= ucfirst($r['tipo_comprobante']) ?></td>
-              <td><?= date('d/m/Y H:i', strtotime($r['fecha'])) ?></td>
-              <td><?= htmlspecialchars($r['cliente']) ?></td>
-              <td><?= htmlspecialchars($_metodos[$r['metodo_pago']] ?? $r['metodo_pago']) ?><?= !empty($r['es_mixto']) ? '<span class="mix">mixto</span>' : '' ?></td>
-              <td class="r">S/ <?= number_format((float)$r['total'],2) ?></td>
+          <?php
+          $orden=[]; $byVenta=[];
+          foreach ($rows as $r) { $vid=(int)$r['id']; if(!isset($byVenta[$vid])){ $byVenta[$vid]=[]; $orden[]=$vid; } $byVenta[$vid][]=$r; }
+          foreach ($orden as $vid):
+            $grp=$byVenta[$vid]; $items=$items_por_venta[$vid]??[]; $rep=$grp[0];
+            $nrec=$_num_recibo($rep); $comp=ucfirst($rep['tipo_comprobante']); $fch=date('d/m/Y H:i',strtotime($rep['fecha'])); $cli=$rep['cliente']; $metL=$_metodos[$rep['metodo_pago']]??$rep['metodo_pago'];
+            if (count($grp)===1 && count($items)===1): $it=$items[0]; ?>
+            <tr class="rec">
+              <td><?= htmlspecialchars($nrec) ?></td><td><?= $comp ?></td><td><?= $fch ?></td>
+              <td><?= htmlspecialchars($cli) ?></td><td><?= htmlspecialchars($metL) ?></td>
+              <td class="r">S/ <?= number_format((float)$rep['total'],2) ?></td>
+              <td class="qty"><?= 0+$it['cant'] ?></td><td><?= htmlspecialchars($it['nom']) ?></td>
             </tr>
+            <?php else: ?>
+              <?php foreach ($grp as $r): ?>
+              <tr class="rec">
+                <td><?= htmlspecialchars($_num_recibo($r)) ?></td><td><?= ucfirst($r['tipo_comprobante']) ?></td>
+                <td><?= date('d/m/Y H:i', strtotime($r['fecha'])) ?></td><td><?= htmlspecialchars($r['cliente']) ?></td>
+                <td><?= htmlspecialchars($_metodos[$r['metodo_pago']] ?? $r['metodo_pago']) ?><?= !empty($r['es_mixto']) ? '<span class="mix">mixto</span>' : '' ?></td>
+                <td class="r">S/ <?= number_format((float)$r['total'],2) ?></td><td></td><td></td>
+              </tr>
+              <?php endforeach; ?>
+              <?php foreach ($items as $it): ?>
+              <tr class="itm">
+                <td><?= htmlspecialchars($nrec) ?></td><td><?= $comp ?></td><td><?= $fch ?></td>
+                <td><?= htmlspecialchars($cli) ?></td><td><?= htmlspecialchars($metL) ?></td>
+                <td></td><td class="qty"><?= 0+$it['cant'] ?></td><td class="prod"><?= htmlspecialchars($it['nom']) ?></td>
+              </tr>
+              <?php endforeach; ?>
+            <?php endif; ?>
           <?php endforeach; ?>
           <?php if (empty($rows)): ?>
-            <tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:24px">Sin pagos en el periodo seleccionado.</td></tr>
+            <tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:24px">Sin pagos en el periodo seleccionado.</td></tr>
           <?php endif; ?>
-            <tr class="total-row"><td colspan="5" class="r">TOTAL</td><td class="r">S/ <?= number_format($total_general,2) ?></td></tr>
+            <tr class="total-row"><td colspan="5" class="r">TOTAL</td><td class="r">S/ <?= number_format($total_general,2) ?></td><td></td><td></td></tr>
           </tbody>
         </table>
         <div class="foot"><?= htmlspecialchars($clinica) ?> · Generado el <?= date('d/m/Y H:i') ?> · VetPro</div>
