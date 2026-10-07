@@ -268,6 +268,9 @@ $msg = $_GET['msg'] ?? ''; $err = $_GET['err'] ?? '';
         <?php foreach($movimientos as $m):
           $mot = $MOV_MOTIVOS[$m['motivo']] ?? ['Sin motivo','📝','#64748b',false];
           $tcolor = ['entrada'=>'#10b981','salida'=>'#ef4444','ajuste'=>'#8b5cf6','traslado'=>'#06b6d4','venta'=>'#3b82f6'][$m['tipo']] ?? '#64748b';
+          // El signo sale del movimiento real de stock: las ventas guardan
+          // `cantidad` en positivo y se mostraban como "+1" aunque restaran.
+          $delta = (int)$m['stock_nuevo'] - (int)$m['stock_anterior'];
         ?>
         <tr style="border-bottom:1px solid var(--border)">
           <td class="text-muted text-sm"><?= date('d/m/Y H:i', strtotime($m['created_at'])) ?></td>
@@ -275,7 +278,7 @@ $msg = $_GET['msg'] ?? ''; $err = $_GET['err'] ?? '';
           <td><span class="badge" style="background:<?= $m['origen']==='petshop'?'#fef3c7':'#dbeafe' ?>;color:<?= $m['origen']==='petshop'?'#92400e':'#1e40af' ?>"><?= $m['origen']==='petshop'?'🛒 Pet Shop':'💊 Farmacia' ?></span></td>
           <td><span style="color:<?= $tcolor ?>;font-weight:700;text-transform:uppercase;font-size:11px"><?= $m['tipo'] ?></span></td>
           <td><?= $mot[1] ?> <?= clean($mot[0]) ?></td>
-          <td style="text-align:right;font-weight:700;color:<?= ((int)$m['cantidad'])>=0?'#10b981':'#ef4444' ?>"><?= ((int)$m['cantidad'])>=0?'+':'' ?><?= (int)$m['cantidad'] ?></td>
+          <td style="text-align:right;font-weight:700;color:<?= $delta>=0?'#10b981':'#ef4444' ?>"><?= $delta>=0?'+':'' ?><?= $delta ?></td>
           <td class="text-xs text-muted"><?= (int)$m['stock_anterior'] ?> → <?= (int)$m['stock_nuevo'] ?></td>
           <td class="text-sm"><?= clean($m['usuario'] ?: '—') ?></td>
           <td class="text-xs text-muted"><?= clean($m['notas'] ?: '—') ?></td>

@@ -388,6 +388,71 @@ function registrarEgresoAnulacion(PDO $db, int $ventaId, int $usuarioId, string 
     }
 }
 
+/**
+ * Anula una venta y devuelve al inventario el stock que descontó.
+ *
+ * Es el único camino para pasar una venta a 'anulado': lo usan la anulación
+ * directa (tickets / comprobantes sin XML) y la aceptación de una nota de
+ * crédito por SUNAT (boletas y facturas). Antes la nota de crédito solo
+ * cambiaba el estado y el stock nunca volvía.
+ *
+ * El UPDATE con `estado<>'anulado'` es la llave de idempotencia: si la venta
+ * ya estaba anulada (doble clic, reenvío, nota sobre una venta anulada a mano)
+ * no se toca el stock, así nunca se devuelve dos veces.
+ *
+ * Kardex solo se escribe para farmacia (FK a `productos.id`), igual que al vender.
+ *
+ * @return bool true si la venta se anuló ahora; false si ya estaba anulada o no existe.
+ */
+function anularVentaConStock(PDO $db, int $ventaId, int $usuarioId): bool {
+    $propia = !$db->inTransaction();
+    if ($propia) $db->beginTransaction();
+    try {
+        $up = $db->prepare("UPDATE ventas SET estado='anulado' WHERE id=? AND estado<>'anulado'");
+        $up->execute([$ventaId]);
+        if ($up->rowCount() === 0) {
+            if ($propia) $db->commit();
+            return false;
+        }
+
+        $st = $db->prepare("SELECT sede_id FROM ventas WHERE id=?");
+        $st->execute([$ventaId]);
+        $sedeId = (int)($st->fetchColumn() ?: 1);
+
+        $stItems = $db->prepare("SELECT tipo, referencia_id, cantidad, descripcion FROM venta_items WHERE venta_id=?");
+        $stItems->execute([$ventaId]);
+        $stKardex = $db->prepare("INSERT INTO kardex (producto_id,usuario_id,tipo,cantidad,stock_anterior,stock_nuevo,referencia,notas,origen,sede_id) VALUES (?,?, 'entrada',?,?,?,?,?,?,?)");
+        foreach ($stItems->fetchAll() as $iv) {
+            $refId = (int)$iv['referencia_id'];
+            if ($refId <= 0) continue;
+            $tabla = $iv['tipo'] === 'petshop' ? 'petshop_productos' : ($iv['tipo'] === 'producto' ? 'productos' : null);
+            if (!$tabla) continue;
+
+            $stP = $db->prepare("SELECT stock FROM $tabla WHERE id=? FOR UPDATE");
+            $stP->execute([$refId]);
+            $stockAnt = $stP->fetchColumn();
+            if ($stockAnt === false) continue; // producto eliminado: nada que reponer
+            $stockAnt = (int)$stockAnt;
+            $qty = (int)$iv['cantidad'];
+
+            $db->prepare("UPDATE $tabla SET stock=? WHERE id=?")->execute([$stockAnt + $qty, $refId]);
+            if ($iv['tipo'] === 'producto') {
+                $stKardex->execute([
+                    $refId, $usuarioId, $qty, $stockAnt, $stockAnt + $qty,
+                    'ANULACION-' . $ventaId, $iv['descripcion'] . ' (devolución por anulación)',
+                    'farmacia', $sedeId,
+                ]);
+            }
+        }
+
+        if ($propia) $db->commit();
+        return true;
+    } catch (Throwable $e) {
+        if ($propia && $db->inTransaction()) $db->rollBack();
+        throw $e;
+    }
+}
+
 
 
 

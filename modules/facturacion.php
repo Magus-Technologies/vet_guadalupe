@@ -291,28 +291,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         }
 
-        $db->prepare("UPDATE ventas SET estado='anulado' WHERE id=?")->execute([$anular_id]);
-        // Devolver al inventario el stock descontado por esta venta (kardex tipo 'venta' inverso)
-        $stItems = $db->prepare("SELECT tipo, referencia_id, cantidad, descripcion FROM venta_items WHERE venta_id=?");
-        $stItems->execute([$anular_id]);
-        $stKardex = $db->prepare("INSERT INTO kardex (producto_id,usuario_id,tipo,cantidad,stock_anterior,stock_nuevo,referencia,notas,origen,sede_id) VALUES (?,?, 'entrada',?,?,?,?,?,?,?)");
-        foreach ($stItems->fetchAll() as $iv) {
-            $ref_id = (int)$iv['referencia_id'];
-            if ($ref_id <= 0) continue;
-            $tabla = $iv['tipo'] === 'petshop' ? 'petshop_productos' : ($iv['tipo'] === 'producto' ? 'productos' : null);
-            if (!$tabla) continue;
-            $stP = $db->prepare("SELECT stock FROM $tabla WHERE id=?");
-            $stP->execute([$ref_id]);
-            $stock_ant = (int)$stP->fetchColumn();
-            $qty = (int)$iv['cantidad'];
-            $db->prepare("UPDATE $tabla SET stock=? WHERE id=?")->execute([$stock_ant + $qty, $ref_id]);
-            if ($iv['tipo'] === 'producto') {
-                $stKardex->execute([
-                    $ref_id, (int)$user['id'], $qty, $stock_ant, $stock_ant + $qty,
-                    'ANULACION-' . $anular_id, $iv['descripcion'] . ' (devolución por anulación)',
-                    'farmacia', getSede(),
-                ]);
-            }
+        // Estado + devolución de stock en una sola transacción. Si ya estaba
+        // anulada (doble clic / reenvío) no repone stock por segunda vez.
+        try {
+            anularVentaConStock($db, $anular_id, (int)$user['id']);
+        } catch (Throwable $e) {
+            $_SESSION['flash_error'] = 'No se pudo anular la venta: ' . $e->getMessage();
+            header('Location: '.BASE_URL.'/index.php?p=facturacion');
+            exit;
         }
         // Descuenta de la caja abierta lo que esta venta había ingresado.
         $tuvo_ingreso = (int)$db->query("SELECT COUNT(*) FROM movimientos_caja WHERE tipo='ingreso' AND venta_id=".$anular_id)->fetchColumn();

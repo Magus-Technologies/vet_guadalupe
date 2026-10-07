@@ -228,13 +228,28 @@ class SunatService
         ");
         $st->execute([$env['cdr'] ?? '', $env['mensaje'] ?? 'ACEPTADO', $notaId]);
 
+        $avisoStock = '';
         if ($nota['tipo_nota'] === 'credito') {
-            $ventaId = (int) $nota['venta_id'];
-            $this->db->prepare("UPDATE ventas SET estado='anulado' WHERE id=?")->execute([$ventaId]);
+            $ventaId   = (int) $nota['venta_id'];
+            $usuarioId = (int) ($_SESSION['user']['id'] ?? 0);
+
+            // La nota de crédito siempre va por el total de la venta: se anula
+            // y la mercadería vuelve al inventario. SUNAT ya aceptó la nota, así
+            // que un fallo al reponer stock no debe dejar la venta como vigente.
+            try {
+                if (function_exists('anularVentaConStock') && $usuarioId > 0) {
+                    anularVentaConStock($this->db, $ventaId, $usuarioId);
+                } else {
+                    $this->db->prepare("UPDATE ventas SET estado='anulado' WHERE id=?")->execute([$ventaId]);
+                    $avisoStock = ' Atención: el stock NO se devolvió automáticamente; regístralo en Inventario.';
+                }
+            } catch (Throwable $e) {
+                $this->db->prepare("UPDATE ventas SET estado='anulado' WHERE id=?")->execute([$ventaId]);
+                $avisoStock = ' Atención: no se pudo devolver el stock (' . $e->getMessage() . '); regístralo en Inventario.';
+            }
 
             // La venta deja de ser ingreso: se compensa en la caja abierta.
             if (function_exists('registrarEgresoAnulacion')) {
-                $usuarioId = (int) ($_SESSION['user']['id'] ?? 0);
                 if ($usuarioId > 0) {
                     registrarEgresoAnulacion(
                         $this->db, $ventaId, $usuarioId,
@@ -246,7 +261,7 @@ class SunatService
 
         return [
             'ok'      => true,
-            'mensaje' => 'Nota aceptada por SUNAT.',
+            'mensaje' => 'Nota aceptada por SUNAT.' . $avisoStock,
             'cdr'     => $env['cdr'] ?? '',
         ];
     }
