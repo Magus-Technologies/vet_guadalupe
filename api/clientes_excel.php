@@ -67,6 +67,12 @@ if ($act === 'plantilla') {
 }
 
 if ($act === 'exportar') {
+    // 🔒 Candado de permiso: solo roles con "Exportar" en Clientes (o Administrador).
+    if (!function_exists('canExport') || !canExport('clientes')) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=UTF-8');
+        exit('🔒 No tienes permiso para exportar clientes.');
+    }
     $where = "activo=1";
     try {
         $r = $db->query("SHOW COLUMNS FROM clientes LIKE 'sede_id'")->fetchAll();

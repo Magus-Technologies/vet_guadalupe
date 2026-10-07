@@ -97,6 +97,9 @@ function leer_xlsx($path) {
 $action = $_GET['action'] ?? 'list';
 $msg = '';
 
+// Permiso de exportación para este rol (Administrador siempre puede).
+$puede_exportar = canExport('clientes');
+
 if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action'])) {
     $a = $_POST['action'];
     if ($a === 'save') {
@@ -560,6 +563,12 @@ function showResultado(tipo, html) {
 <?php
 // ── EXPORTAR EXCEL ──
 if (($_GET['action']??'') === 'exportar_excel') {
+    // Candado de permiso: sin "Exportar" en el rol, no se genera el archivo.
+    if (!canExport('clientes')) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=UTF-8');
+        exit('🔒 No tienes permiso para exportar clientes.');
+    }
     $exp_sw = "activo=1";
     try { $r=$db->query("SHOW COLUMNS FROM clientes LIKE 'sede_id'")->fetchAll(); if(!empty($r)&&!verTodasSedes()) $exp_sw.=" AND sede_id=".getSede(); } catch(Exception $e){}
     $rows = $db->query("SELECT nombre,dni,ruc,telefono,email,direccion,como_conocio,notas FROM clientes WHERE $exp_sw ORDER BY nombre")->fetchAll();
@@ -736,10 +745,12 @@ if (!empty($msg) && strpos($msg,'import_ok:') === 0) {
       <input class="form-input" name="q" value="<?= clean($search) ?>" placeholder="Nombre, DNI, RUC, teléfono..." style="width:220px">
       <button type="submit" class="btn">Buscar</button>
     </form>
-    <!-- Exportar -->
+    <!-- Exportar (solo si el rol tiene permiso) -->
+    <?php if($puede_exportar): ?>
     <a href="<?= BASE_URL ?>/api/clientes_excel.php?action=exportar" class="btn btn-sm btn-ghost" style="color:var(--success);border-color:var(--success)" title="Exportar clientes a Excel">
       📥 Exportar Excel
     </a>
+    <?php endif; ?>
     <!-- Importar -->
     <button type="button" onclick="document.getElementById('modal-import').style.display='flex'" class="btn btn-sm btn-ghost" style="color:var(--accent);border-color:var(--accent)">
       📤 Importar Excel

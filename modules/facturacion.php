@@ -781,16 +781,16 @@ if (isset($_SESSION['flash_error'])) {
           <label class="form-label mt-2">¿Aplica IGV?</label>
           <div class="igv-toggle">
             <label class="igv-opt">
-              <input type="radio" name="aplica_igv" value="1" onchange="toggleIgv()">
+              <input type="radio" name="aplica_igv" value="1" checked onchange="toggleIgv()">
               <span class="igv-pill"><span class="igv-ico">✓</span><span>Sí (gravado)</span></span>
             </label>
             <label class="igv-opt">
-              <input type="radio" name="aplica_igv" value="0" checked onchange="toggleIgv()">
+              <input type="radio" name="aplica_igv" value="0" onchange="toggleIgv()">
               <span class="igv-pill"><span class="igv-ico">○</span><span>No (exonerado)</span></span>
             </label>
           </div>
           <div id="igv-info" class="mt-2" style="font-size:11.5px;padding:9px 12px;border-radius:8px;background:#fef3c7;border:1px solid #fde68a;color:#92400e">
-            🧾 Los precios <strong>NO incluyen IGV</strong>. Se emite como comprobante exonerado/inafecto.
+            ℹ Los precios <strong>incluyen IGV (18%)</strong>. Se desglosa automáticamente en el comprobante.
           </div>
           <style>
             .igv-toggle { display:grid;grid-template-columns:1fr 1fr;gap:6px }
@@ -1114,6 +1114,51 @@ if (isset($_SESSION['flash_error'])) {
 
 <?php else: ?>
 <!-- ════════════════════════════ LISTA ════════════════════════════ -->
+<?php
+// ── Facturado HOY (para el cierre diario). Se muestra SIEMPRE, pero el monto
+//    se ajusta a lo que cada usuario puede ver: recepción/admin ven el total
+//    de la SEDE; el veterinario (limitado a sus propios comprobantes) ve SU
+//    facturado del día. No revela nada nuevo: esos montos ya salen fila por
+//    fila en la lista de abajo, con el mismo alcance por usuario.
+$fact_hoy_total = 0.0; $fact_hoy_n = 0; $fact_hoy_mp = [];
+$__hoy   = date('Y-m-d');
+$__scope = verTodasSedes() ? '' : (' AND v.sede_id=' . (int)getSede());
+if ($solo_mios) { $__scope .= ' AND v.usuario_id=' . (int)$mi_id; }
+try {
+    $q = $db->prepare("SELECT COUNT(*) n, COALESCE(SUM(v.total),0) total
+                       FROM ventas v
+                       WHERE v.estado='pagado' AND DATE(v.fecha)=?" . $__scope);
+    $q->execute([$__hoy]); $r0 = $q->fetch();
+    $fact_hoy_total = (float)($r0['total'] ?? 0);
+    $fact_hoy_n     = (int)($r0['n'] ?? 0);
+    // Desglose por método (usa venta_pagos → refleja pagos mixtos por su monto real)
+    $q2 = $db->prepare("SELECT vp.metodo_pago mp, COALESCE(SUM(vp.monto),0) monto
+                        FROM venta_pagos vp JOIN ventas v ON v.id=vp.venta_id
+                        WHERE v.estado='pagado' AND DATE(v.fecha)=?" . $__scope . "
+                        GROUP BY vp.metodo_pago ORDER BY monto DESC");
+    $q2->execute([$__hoy]); $fact_hoy_mp = $q2->fetchAll();
+} catch (Exception $e) { $fact_hoy_total = 0; $fact_hoy_n = 0; $fact_hoy_mp = []; }
+$fact_hoy_titulo = $solo_mios ? 'Mi facturado hoy' : 'Facturado hoy';
+?>
+<div class="card mb-2" style="padding:0;overflow:hidden;border:1.5px solid var(--teal)">
+  <div style="display:flex;flex-wrap:wrap;align-items:stretch">
+    <div style="background:var(--teal-l);padding:16px 22px;min-width:210px;display:flex;flex-direction:column;justify-content:center;border-right:1px solid var(--teal)">
+      <div style="font-size:11px;font-weight:700;color:var(--teal-d);text-transform:uppercase;letter-spacing:.5px">📅 <?= $fact_hoy_titulo ?> · <?= date('d/m/Y') ?></div>
+      <div style="font-size:28px;font-weight:800;color:var(--teal-d);line-height:1.1;margin-top:4px">S/. <?= number_format($fact_hoy_total,2) ?></div>
+      <div style="font-size:12px;color:var(--text3);margin-top:2px"><?= $fact_hoy_n ?> comprobante<?= $fact_hoy_n!=1?'s':'' ?> pagado<?= $fact_hoy_n!=1?'s':'' ?></div>
+    </div>
+    <div style="flex:1;padding:14px 18px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;min-width:200px">
+      <?php if (empty($fact_hoy_mp)): ?>
+        <span style="font-size:13px;color:var(--text3)">Aún no hay ventas registradas hoy.</span>
+      <?php else: foreach ($fact_hoy_mp as $mp): ?>
+        <div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:8px 14px;min-width:110px">
+          <div style="font-size:11px;color:var(--text3)"><?= clean(ucfirst(str_replace('_',' ',$mp['mp']))) ?></div>
+          <div style="font-size:16px;font-weight:800;color:var(--text)">S/. <?= number_format((float)$mp['monto'],2) ?></div>
+        </div>
+      <?php endforeach; endif; ?>
+    </div>
+  </div>
+</div>
 <div class="grid <?= $ver_dinero ? 'g4' : 'g3' ?> mb-2">
   <?php if($ver_dinero): ?>
   <div class="stat-card"><div class="stat-icon si-teal">💰</div><div class="stat-value">S/. <?= number_format($total_periodo,0) ?></div><div class="stat-label">Ingresos del período</div></div>

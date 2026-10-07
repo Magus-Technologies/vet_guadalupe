@@ -210,9 +210,11 @@ if (in_array(($_GET['action'] ?? ''), ['excel','pdf'], true)) {
                     .$cS($_metodos[$r['metodo_pago']] ?? $r['metodo_pago'],'b').$cN($r['total'],'b')
                     .$cE.$cE.'</Row>'."\n";
             }
-            // Filas de ítems (repiten los datos del recibo, Monto en blanco)
+            // Filas de ítems (repiten los datos del recibo). En Monto va el
+            // subtotal del ítem (si el detalle lo tiene); si no, queda en blanco.
             foreach ($items as $it) {
-                echo '<Row>'.$cS($nrec).$cS($comp).$cS($fch).$cS($cli).$cS($metL).$cE
+                $montoItem = ($it['sub'] !== null && $it['sub'] !== '') ? $cN($it['sub']) : $cE;
+                echo '<Row>'.$cS($nrec).$cS($comp).$cS($fch).$cS($cli).$cS($metL).$montoItem
                     .$cQ($it['cant']).$cS($it['nom']).'</Row>'."\n";
             }
         }
@@ -297,7 +299,7 @@ if (in_array(($_GET['action'] ?? ''), ['excel','pdf'], true)) {
               <tr class="itm">
                 <td><?= htmlspecialchars($nrec) ?></td><td><?= $comp ?></td><td><?= $fch ?></td>
                 <td><?= htmlspecialchars($cli) ?></td><td><?= htmlspecialchars($metL) ?></td>
-                <td></td><td class="qty"><?= 0+$it['cant'] ?></td><td class="prod"><?= htmlspecialchars($it['nom']) ?></td>
+                <td class="r"><?= ($it['sub']!==null && $it['sub']!=='') ? 'S/ '.number_format((float)$it['sub'],2) : '' ?></td><td class="qty"><?= 0+$it['cant'] ?></td><td class="prod"><?= htmlspecialchars($it['nom']) ?></td>
               </tr>
               <?php endforeach; ?>
             <?php endif; ?>
